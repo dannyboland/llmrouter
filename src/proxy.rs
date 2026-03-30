@@ -31,15 +31,10 @@ pub enum ProxyBody {
 fn build_upstream_url(candidate: &ResolvedCandidate, path: &str) -> String {
     let base = candidate.base_url.trim_end_matches('/');
 
-    // Strip /v1 prefix from path — either because base_url already has it,
-    // or because the provider (Azure) doesn't use it at all.
-    let is_azure = matches!(candidate.kind, ProviderKind::AzureOpenAi { .. });
-    let strip_v1 = base.ends_with("/v1") || is_azure;
-    let effective_path = if strip_v1 && path.starts_with("/v1/") {
-        &path[3..] // strip "/v1" prefix, keeping the "/"
-    } else {
-        path
-    };
+    // Clients send OpenAI-compatible paths like /v1/chat/completions.
+    // Strip the /v1 prefix — every provider's base_url already includes
+    // the correct version prefix (e.g. /v1, /v1beta1, /openai).
+    let effective_path = path.strip_prefix("/v1").unwrap_or(path);
 
     match candidate.kind {
         ProviderKind::AzureOpenAi { ref api_version } => {
@@ -416,6 +411,19 @@ mod tests {
         let c = make_candidate(ProviderKind::ApiKey, "https://api.openai.com/v1");
         let url = build_upstream_url(&c, "/v1/chat/completions");
         assert_eq!(url, "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn url_vertex_strips_v1() {
+        let c = make_candidate(
+            ProviderKind::GcpMetadata,
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/p/locations/l/endpoints/openapi",
+        );
+        let url = build_upstream_url(&c, "/v1/chat/completions");
+        assert_eq!(
+            url,
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/p/locations/l/endpoints/openapi/chat/completions"
+        );
     }
 
     #[test]
