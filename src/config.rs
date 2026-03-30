@@ -73,7 +73,6 @@ impl AnthropicConfig {
 }
 
 impl ProviderConfig {
-    /// Resolved base URL, accounting for provider shorthands.
     pub fn resolved_base_url(&self) -> Option<String> {
         self.base_url.clone().or_else(|| {
             if let Some(ref v) = self.vertex_ai {
@@ -101,7 +100,6 @@ impl ProviderConfig {
         })
     }
 
-    /// Resolved provider kind with associated runtime data.
     pub fn resolved_kind(&self) -> ProviderKind {
         if self.vertex_ai.is_some() {
             return ProviderKind::GcpMetadata;

@@ -1,21 +1,18 @@
 use crate::config::{Config, ModelCandidate, ProviderConfig};
 use std::collections::HashMap;
 
-/// Provider kind with associated runtime config.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderKind {
-    /// Standard OpenAI-compatible: Bearer token auth.
-    /// Also used by Google AI Studio (via google_ai shorthand).
+    /// Bearer token auth. Also used by Google AI Studio.
     ApiKey,
-    /// GCP Vertex AI: access token from metadata server.
+    /// Access token from GCP metadata server.
     GcpMetadata,
-    /// Azure OpenAI: api-key header + deployment URL rewriting.
+    /// api-key header + deployment URL rewriting.
     AzureOpenAi { api_version: String },
-    /// Anthropic: x-api-key header + anthropic-version header.
+    /// x-api-key header + anthropic-version header.
     Anthropic { version: String },
 }
 
-/// Resolved candidate with provider details baked in.
 #[derive(Debug, Clone)]
 pub struct ResolvedCandidate {
     pub provider_name: String,
@@ -25,7 +22,6 @@ pub struct ResolvedCandidate {
     pub kind: ProviderKind,
 }
 
-/// Maps alias names to resolved candidate lists.
 pub struct ModelMap {
     aliases: HashMap<String, Vec<ResolvedCandidate>>,
 }

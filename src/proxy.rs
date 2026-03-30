@@ -11,13 +11,11 @@ use tracing::{debug, warn};
 use crate::gcp_auth::GcpTokenProvider;
 use crate::model_map::{ProviderKind, ResolvedCandidate};
 
-/// Response body type returned by the proxy.
 pub type HyperBody = http_body_util::Either<
     Full<Bytes>,
     StreamBody<futures_util::stream::BoxStream<'static, Result<Frame<Bytes>, Infallible>>>,
 >;
 
-/// Result of forwarding a request to an upstream provider.
 pub struct ProxyResult {
     pub status: hyper::StatusCode,
     pub headers: hyper::HeaderMap,
@@ -30,7 +28,6 @@ pub enum ProxyBody {
     Full(Bytes),
 }
 
-/// Construct the upstream URL for a candidate and incoming path.
 fn build_upstream_url(candidate: &ResolvedCandidate, path: &str) -> String {
     let base = candidate.base_url.trim_end_matches('/');
 
@@ -56,7 +53,6 @@ fn build_upstream_url(candidate: &ResolvedCandidate, path: &str) -> String {
     }
 }
 
-/// Forward a request to the chosen upstream candidate.
 pub async fn forward_request(
     client: &Client,
     candidate: &ResolvedCandidate,
@@ -102,7 +98,6 @@ pub async fn forward_request(
 
     let status = hyper::StatusCode::from_u16(response.status().as_u16())?;
 
-    // Convert response headers
     let mut headers = hyper::HeaderMap::new();
     for (k, v) in response.headers() {
         if let (Ok(name), Ok(val)) = (
@@ -253,8 +248,7 @@ pub fn extract_json_bool(body: &[u8], field: &str) -> Option<bool> {
     None
 }
 
-/// Rewrite the `"model"` field in a JSON body to the real model name.
-/// Operates on raw bytes — splices the new value in without parsing the full body.
+/// Splice the real model name into the JSON body without full parsing.
 pub fn rewrite_model(
     body: &[u8],
     real_model: &str,
@@ -267,6 +261,46 @@ pub fn rewrite_model(
     result.extend_from_slice(real_model.as_bytes());
     result.extend_from_slice(&body[range.end..]);
     Ok(Bytes::from(result))
+}
+
+/// On error, emits an SSE error event and terminates the stream (instead of
+/// silently truncating).
+fn build_relay_stream<S, E>(
+    stream: S,
+) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display,
+{
+    stream.scan(false, |errored, result| {
+        if *errored {
+            return futures_util::future::ready(None);
+        }
+        match result {
+            Ok(chunk) => futures_util::future::ready(Some(Ok(Frame::data(chunk)))),
+            Err(e) => {
+                warn!("stream chunk error: {e}");
+                *errored = true;
+                let error_event = format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "error": {
+                            "message": "upstream stream error",
+                            "type": "proxy_error",
+                        }
+                    })
+                );
+                futures_util::future::ready(Some(Ok(Frame::data(Bytes::from(error_event)))))
+            }
+        }
+    })
+}
+
+pub fn into_hyper_body(proxy_body: ProxyBody) -> HyperBody {
+    match proxy_body {
+        ProxyBody::Full(bytes) => http_body_util::Either::Left(Full::new(bytes)),
+        ProxyBody::Streaming(stream) => http_body_util::Either::Right(StreamBody::new(stream)),
+    }
 }
 
 #[cfg(test)]
@@ -397,49 +431,5 @@ mod tests {
             url,
             "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
         );
-    }
-}
-
-/// Build a relay stream that maps upstream chunks to hyper Frames.
-/// On error, emits an SSE error event and terminates the stream so the
-/// client knows something went wrong (instead of silently truncating).
-fn build_relay_stream<S, E>(
-    stream: S,
-) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>>
-where
-    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
-    E: std::fmt::Display,
-{
-    // Use scan to track error state: yields Some(frame) for each item,
-    // and returns None to terminate the stream after emitting an error event.
-    stream.scan(false, |errored, result| {
-        if *errored {
-            return futures_util::future::ready(None);
-        }
-        match result {
-            Ok(chunk) => futures_util::future::ready(Some(Ok(Frame::data(chunk)))),
-            Err(e) => {
-                warn!("stream chunk error: {e}");
-                *errored = true;
-                let error_event = format!(
-                    "data: {}\n\n",
-                    serde_json::json!({
-                        "error": {
-                            "message": "upstream stream error",
-                            "type": "proxy_error",
-                        }
-                    })
-                );
-                futures_util::future::ready(Some(Ok(Frame::data(Bytes::from(error_event)))))
-            }
-        }
-    })
-}
-
-/// Create a hyper response body from a ProxyBody.
-pub fn into_hyper_body(proxy_body: ProxyBody) -> HyperBody {
-    match proxy_body {
-        ProxyBody::Full(bytes) => http_body_util::Either::Left(Full::new(bytes)),
-        ProxyBody::Streaming(stream) => http_body_util::Either::Right(StreamBody::new(stream)),
     }
 }

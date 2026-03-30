@@ -18,7 +18,6 @@ use crate::router::{self, candidate_key, RoundRobinState};
 use crate::session::SessionStore;
 use crate::tracker::Tracker;
 
-/// Shared application state.
 pub struct AppState {
     pub model_map: ModelMap,
     pub tracker: Tracker,
@@ -167,10 +166,6 @@ pub async fn handle_request(
 
     let is_streaming = proxy::extract_json_bool(&body_bytes, "stream").unwrap_or(false);
 
-    if let Some(stats) = state.tracker.get(&key) {
-        stats.in_flight.fetch_add(1, Ordering::Relaxed);
-    }
-
     info!(
         alias = %alias,
         provider = %candidate.provider_name,
@@ -197,10 +192,6 @@ pub async fn handle_request(
                 state.tracker.record_success(&key);
             } else {
                 state.tracker.record_error(&key);
-            }
-
-            if let Some(stats) = state.tracker.get(&key) {
-                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
             }
 
             debug!(
@@ -233,10 +224,6 @@ pub async fn handle_request(
 
             state.tracker.record_error(&key);
 
-            if let Some(stats) = state.tracker.get(&key) {
-                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-            }
-
             Ok(json_error(
                 hyper::StatusCode::BAD_GATEWAY,
                 &format!("upstream error: {e}"),
@@ -255,8 +242,6 @@ fn json_response(status: u16, body: Bytes) -> Response<BoxBody> {
         .unwrap()
 }
 
-/// Run the server accept loop until the shutdown signal fires.
-/// After shutdown, in-flight connections are allowed to complete gracefully.
 pub async fn run_server(
     listener: TcpListener,
     state: Arc<AppState>,
@@ -320,7 +305,6 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
             "model": key.1,
             "status": status,
             "ewma_ms": if ewma == u64::MAX { None } else { Some(ewma) },
-            "in_flight": stats.in_flight.load(Ordering::Relaxed),
             "error_rate": stats.error_rate(),
         }));
     }
