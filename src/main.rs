@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use llmrouter::gcp_auth::GcpTokenProvider;
+use llmrouter::metrics::Metrics;
 use llmrouter::model_map::{ModelMap, ProviderKind};
 use llmrouter::router::RoundRobinState;
 use llmrouter::server::AppState;
@@ -93,6 +94,20 @@ async fn main() -> anyhow::Result<()> {
         config.routing.max_sessions,
     );
 
+    let metrics = Metrics::new();
+    let label_triples: Vec<_> = model_map
+        .alias_names()
+        .iter()
+        .flat_map(|alias| {
+            model_map
+                .get(alias)
+                .unwrap_or_default()
+                .iter()
+                .map(|c| (alias.to_string(), c.provider_name.clone(), c.model.clone()))
+        })
+        .collect();
+    metrics.init_zero(&label_triples);
+
     let state = Arc::new(AppState {
         model_map,
         tracker: tracker_inner,
@@ -102,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         gcp_token_provider,
         session_store,
         max_body_bytes,
+        metrics,
     });
 
     let addr: SocketAddr = config.listen.parse()?;

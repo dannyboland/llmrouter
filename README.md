@@ -102,6 +102,7 @@ Environment variables in `${VAR}` syntax are interpolated at config load time.
 | POST | `/v1/embeddings` | Proxied to upstream (model alias resolved) |
 | GET | `/health` | Returns `{"status":"ok"}` |
 | GET | `/status` | Returns current EWMA, error rate, and status per candidate |
+| GET | `/metrics` | Prometheus metrics (request counts, TTFC histogram, errors) |
 
 ## Session affinity
 
