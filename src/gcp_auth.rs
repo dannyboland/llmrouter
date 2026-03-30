@@ -7,15 +7,13 @@ use tracing::debug;
 const METADATA_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
-/// Cached GCP access token fetched from the metadata server.
 struct CachedToken {
     token: String,
     expires_at: Instant,
 }
 
-/// Fetches and caches GCP access tokens from the GKE metadata server.
-/// Safe to share across requests. The lock is held through the fetch to
-/// prevent concurrent requests from redundantly hitting the metadata server.
+/// Fetches and caches GCP access tokens from the metadata server.
+/// The lock is held through the fetch to coalesce concurrent refreshes.
 pub struct GcpTokenProvider {
     client: Client,
     cache: Mutex<Option<CachedToken>>,
@@ -29,19 +27,15 @@ impl GcpTokenProvider {
         })
     }
 
-    /// Get a valid access token, refreshing from the metadata server if needed.
     pub async fn get_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let mut cache = self.cache.lock().await;
 
-        // Return cached token if still valid (refresh 60s before expiry)
         if let Some(ref cached) = *cache {
             if cached.expires_at > Instant::now() + Duration::from_secs(60) {
                 return Ok(cached.token.clone());
             }
         }
 
-        // Cache miss or expired — fetch while holding the lock so only
-        // one request hits the metadata server at a time.
         debug!("refreshing GCP access token from metadata server");
         let resp = self
             .client

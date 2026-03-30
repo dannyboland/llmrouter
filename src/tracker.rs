@@ -1,20 +1,16 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Key: (provider_name, model_name)
 pub type CandidateKey = (String, String);
 
-/// Tracks the outcome (success/failure) of recent requests in a time-based
-/// moving window. Entries older than `window` are pruned on each access,
-/// so errors naturally age out without an abrupt reset.
+/// Time-windowed sliding buffer of request outcomes. Entries older than
+/// `window` are pruned on access, so errors age out naturally.
 struct ErrorWindow {
-    /// Recent outcomes: (timestamp, success). Oldest entries at the front.
     outcomes: VecDeque<(Instant, bool)>,
-    /// How long outcomes are retained.
     window: Duration,
-    /// Maximum entries to retain (prevents unbounded growth under high load).
     max_entries: usize,
 }
 
@@ -46,8 +42,6 @@ impl ErrorWindow {
         self.outcomes.push_back((Instant::now(), success));
     }
 
-    /// Error rate from 0.0 to 1.0 over entries within the window.
-    /// Returns 0.0 if no requests are in the window.
     fn error_rate(&mut self) -> f64 {
         self.prune();
         let total = self.outcomes.len();
@@ -60,11 +54,8 @@ impl ErrorWindow {
 }
 
 pub struct CandidateStats {
-    /// EWMA of time-to-first-chunk in milliseconds. u64::MAX means cold (no data).
+    /// EWMA of TTFC in milliseconds. u64::MAX = cold (no data).
     pub ewma_ms: AtomicU64,
-    /// Number of in-flight requests.
-    pub in_flight: AtomicU32,
-    /// Time-based sliding window of recent request outcomes.
     error_window: Mutex<ErrorWindow>,
 }
 
@@ -72,7 +63,6 @@ impl CandidateStats {
     pub fn new(error_window_duration: Duration, max_error_window_entries: usize) -> Self {
         Self {
             ewma_ms: AtomicU64::new(u64::MAX),
-            in_flight: AtomicU32::new(0),
             error_window: Mutex::new(ErrorWindow::new(
                 error_window_duration,
                 max_error_window_entries,
@@ -80,7 +70,6 @@ impl CandidateStats {
         }
     }
 
-    /// Lock the error window, recovering from poison by replacing with a fresh window.
     fn lock_window(&self) -> std::sync::MutexGuard<'_, ErrorWindow> {
         self.error_window.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("error window mutex was poisoned, resetting");
@@ -97,7 +86,6 @@ impl CandidateStats {
         self.ewma_ms.load(Ordering::Relaxed) == u64::MAX
     }
 
-    /// Error rate over the recent time window (0.0–1.0).
     pub fn error_rate(&self) -> f64 {
         self.lock_window().error_rate()
     }
@@ -135,11 +123,8 @@ impl CandidateStats {
 pub struct Tracker {
     pub stats: HashMap<CandidateKey, Arc<CandidateStats>>,
     pub alpha: f64,
-    /// Duration of the error tracking window.
     pub error_window_duration: Duration,
-    /// Error rate threshold above which a candidate is considered degraded.
     pub error_threshold: f64,
-    /// Maximum entries per error window.
     pub max_error_window_entries: usize,
 }
 
@@ -190,8 +175,6 @@ impl Tracker {
         }
     }
 
-    /// Whether this candidate is degraded (error rate above threshold
-    /// within the recent time window).
     pub fn is_degraded(&self, key: &CandidateKey) -> bool {
         if let Some(stats) = self.stats.get(key) {
             return stats.error_rate() > self.error_threshold;

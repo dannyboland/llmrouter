@@ -2,12 +2,10 @@ use std::time::Duration;
 
 use crate::tracker::CandidateKey;
 
-/// Key for session lookup: (model_alias, session_id).
 type SessionKey = (String, String);
 
-/// In-memory session store mapping (alias, session_id) to a pinned candidate.
-/// Entries are evicted automatically after the configured TTL (measured from last access).
-/// Backed by moka, which provides lock-free concurrent access and LRU eviction.
+/// Maps (alias, session_id) to a pinned candidate.
+/// Entries are evicted after TTL (measured from last access).
 pub struct SessionStore {
     cache: moka::sync::Cache<SessionKey, CandidateKey>,
 }
