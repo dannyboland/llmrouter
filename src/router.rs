@@ -2,13 +2,10 @@ use crate::model_map::ResolvedCandidate;
 use crate::tracker::{CandidateKey, Tracker};
 use std::sync::atomic::Ordering;
 
-/// Round-robin counters per alias. Two separate counters: one for the
-/// explore-vs-exploit decision, one for distributing across explore candidates.
-/// Keeping them separate avoids counter drift when explore picks consume ticks.
+/// Separate route/explore counters per alias to avoid counter drift when
+/// explore picks consume ticks.
 pub struct RoundRobinState {
-    /// Counter for explore-vs-exploit decision.
     route_counters: std::collections::HashMap<String, std::sync::atomic::AtomicUsize>,
-    /// Counter for distributing across explore candidates.
     explore_counters: std::collections::HashMap<String, std::sync::atomic::AtomicUsize>,
 }
 
@@ -35,8 +32,6 @@ impl RoundRobinState {
             .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0));
     }
 
-    /// Advance the main routing counter. Used for explore-vs-exploit decision
-    /// and for all-cold round-robin.
     pub fn next(&self, alias: &str, count: usize) -> usize {
         if let Some(counter) = self.route_counters.get(alias) {
             counter.fetch_add(1, Ordering::Relaxed) % count
@@ -45,8 +40,6 @@ impl RoundRobinState {
         }
     }
 
-    /// Advance the explore-specific counter. Used to distribute across
-    /// explore candidates without interfering with the routing counter.
     pub fn next_explore(&self, alias: &str, count: usize) -> usize {
         if let Some(counter) = self.explore_counters.get(alias) {
             counter.fetch_add(1, Ordering::Relaxed) % count
@@ -58,17 +51,9 @@ impl RoundRobinState {
 
 /// Pick the best candidate for the given alias.
 ///
-/// Candidates are split into three buckets:
-///   - **warm**: have EWMA data and error rate below threshold → lowest-latency selection
-///   - **cold**: no EWMA data yet → discovered via exploration
-///   - **degraded**: high error rate → excluded from selection entirely
-///
-/// The `explore_ratio` controls what fraction of requests round-robin across all
-/// healthy candidates (warm + cold). This both discovers cold candidates and
-/// periodically re-samples warm-but-not-fastest ones to detect latency changes.
-///
-/// Degraded candidates recover via the timer-based decay in the tracker: after
-/// `error_decay_secs` their error window resets and they rejoin automatically.
+/// Candidates are bucketed into warm (have EWMA data), cold (no data yet),
+/// and degraded (high error rate). `explore_ratio` controls the fraction of
+/// requests that round-robin across warm+cold to discover or re-probe candidates.
 pub fn select_candidate<'a>(
     alias: &str,
     candidates: &'a [ResolvedCandidate],
@@ -112,9 +97,6 @@ pub fn select_candidate<'a>(
         return Some(all_explore[idx].1);
     }
 
-    // Send a proportion of requests to round-robin across all healthy candidates
-    // (warm + cold). This ensures cold candidates get discovered AND warm-but-not-
-    // fastest candidates get periodic probes to detect latency improvements.
     let healthy: Vec<_> = warm.iter().chain(cold.iter()).copied().collect();
     if explore_ratio > 0.0 && healthy.len() > 1 {
         let denom = (1.0 / explore_ratio).round().max(2.0) as usize;
@@ -128,19 +110,9 @@ pub fn select_candidate<'a>(
         .min_by(|(_, a), (_, b)| {
             let ka = candidate_key(a);
             let kb = candidate_key(b);
-            let sa = tracker.get(&ka).unwrap();
-            let sb = tracker.get(&kb).unwrap();
-            let ewma_a = sa.ewma_ms.load(Ordering::Relaxed);
-            let ewma_b = sb.ewma_ms.load(Ordering::Relaxed);
-
-            // If within 10ms, tie-break on in-flight
-            if ewma_a.abs_diff(ewma_b) <= 10 {
-                let inf_a = sa.in_flight.load(Ordering::Relaxed);
-                let inf_b = sb.in_flight.load(Ordering::Relaxed);
-                inf_a.cmp(&inf_b)
-            } else {
-                ewma_a.cmp(&ewma_b)
-            }
+            let ewma_a = tracker.get(&ka).unwrap().ewma_ms.load(Ordering::Relaxed);
+            let ewma_b = tracker.get(&kb).unwrap().ewma_ms.load(Ordering::Relaxed);
+            ewma_a.cmp(&ewma_b)
         })
         .map(|(_, c)| *c)
 }
@@ -206,31 +178,6 @@ mod tests {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
             assert_eq!(picked.provider_name, "fast");
         }
-    }
-
-    #[test]
-    fn tiebreak_on_in_flight() {
-        let candidates = vec![make_candidate("a", "m1"), make_candidate("b", "m2")];
-        let (tracker, rr) = setup(&candidates);
-
-        let ka = ("a".to_string(), "m1".to_string());
-        let kb = ("b".to_string(), "m2".to_string());
-        tracker.record_ttfc(&ka, Duration::from_millis(100));
-        tracker.record_ttfc(&kb, Duration::from_millis(105));
-
-        tracker
-            .get(&ka)
-            .unwrap()
-            .in_flight
-            .store(5, Ordering::Relaxed);
-        tracker
-            .get(&kb)
-            .unwrap()
-            .in_flight
-            .store(1, Ordering::Relaxed);
-
-        let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
-        assert_eq!(picked.provider_name, "b");
     }
 
     #[test]
