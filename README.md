@@ -18,7 +18,7 @@ LLM providers have variable latency and availability that can break production f
 
 ```bash
 cargo build --release
-./target/release/llmrouter --config config.yaml
+./target/release/llmrouter --config config.toml
 ```
 
 Point your OpenAI SDK at `http://127.0.0.1:4000` and use model aliases instead of real model names:
@@ -34,62 +34,55 @@ response = client.chat.completions.create(
 
 ## Configuration
 
-```yaml
-listen: "127.0.0.1:4000"
+```toml
+listen = "127.0.0.1:4000"
 
-providers:
-  - name: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "${OPENAI_API_KEY}"
+# Providers: where to send requests
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
 
-  - name: groq
-    base_url: "https://api.groq.com/openai/v1"
-    api_key: "${GROQ_API_KEY}"
+[provider.groq]
+base_url = "https://api.groq.com/openai/v1"
+api_key = "${GROQ_API_KEY}"
 
-  # Vertex AI via GKE Workload Identity (no API key needed)
-  - name: vertex
-    vertex_ai:
-      project_id: my-gcp-project
-      location: us-central1
+# Vertex AI via GKE Workload Identity (no API key needed)
+[provider.vertex]
+vertex_ai = { project_id = "my-gcp-project", location = "us-central1" }
 
-  # Azure OpenAI
-  - name: azure
-    azure_openai:
-      resource_name: my-resource
-      api_version: "2024-10-21"
-    api_key: "${AZURE_OPENAI_KEY}"
+# Azure OpenAI
+[provider.azure]
+api_key = "${AZURE_OPENAI_KEY}"
+azure_openai = { resource_name = "my-resource", api_version = "2024-10-21" }
 
-  # Google AI Studio
-  - name: gemini
-    google_ai:
-      api_version: v1beta         # optional, defaults to v1beta
-    api_key: "${GEMINI_API_KEY}"
+# Google AI Studio
+[provider.gemini]
+api_key = "${GEMINI_API_KEY}"
+google_ai = { api_version = "v1beta" }  # api_version defaults to v1beta
 
-  # Anthropic
-  - name: anthropic
-    anthropic:
-      version: "2023-06-01"       # optional, defaults to 2023-06-01
-    api_key: "${ANTHROPIC_API_KEY}"
+# Anthropic
+[provider.anthropic]
+api_key = "${ANTHROPIC_API_KEY}"
+anthropic = { version = "2023-06-01" }  # version defaults to 2023-06-01
 
-models:
-  fast:
-    - provider: groq
-      model: llama-3.3-70b-versatile
-    - provider: openai
-      model: gpt-4o-mini
+# Model map: aliases the client uses → provider+model candidates
+[model]
+fast = [
+  { provider = "groq", model = "llama-3.3-70b-versatile" },
+  { provider = "openai", model = "gpt-4o-mini" },
+]
 
-  smart:
-    - provider: openai
-      model: gpt-4.1
-    - provider: vertex
-      model: gemini-2.5-flash
+smart = [
+  { provider = "openai", model = "gpt-4.1" },
+  { provider = "vertex", model = "gemini-2.5-flash" },
+]
 
-routing:
-  ewma_alpha: 0.3          # EWMA smoothing factor (higher = more reactive)
-  explore_ratio: 0.2       # fraction of traffic that round-robins across all healthy candidates
-  error_threshold: 0.5     # error rate above which a candidate is excluded
-  error_decay_secs: 300    # time window for error rate calculation; old errors age out naturally
-  session_ttl_secs: 1800   # sticky session TTL in seconds (default 30 min)
+[routing]
+ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
+explore_ratio = 0.2        # fraction of traffic that round-robins across all healthy candidates
+error_threshold = 0.5      # error rate above which a candidate is excluded
+error_decay_secs = 300     # time window for error rate calculation; old errors age out naturally
+session_ttl_secs = 1800    # sticky session TTL in seconds (default 30 min)
 ```
 
 Environment variables in `${VAR}` syntax are interpolated at config load time.
@@ -133,12 +126,12 @@ Sessions expire after `session_ttl_secs` (default 30 min) of inactivity. If the 
 ## Docker
 
 ```bash
-docker run -v ./config.yaml:/config.yaml \
+docker run -v ./config.toml:/config.toml \
   -p 4000:4000 \
   ghcr.io/dannyboland/llmrouter:latest
 ```
 
-When running in Docker or as a Kubernetes sidecar, set `listen: "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
+When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
 
 ## Building
 

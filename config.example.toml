@@ -1,0 +1,63 @@
+listen = "127.0.0.1:4000"
+
+# Providers: where to send requests
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
+
+[provider.groq]
+base_url = "https://api.groq.com/openai/v1"
+api_key = "${GROQ_API_KEY}"
+
+[provider.local-vllm]
+base_url = "http://localhost:8000/v1"
+
+# Vertex AI via GKE Workload Identity (no API key needed)
+[provider.vertex]
+vertex_ai = { project_id = "my-gcp-project", location = "us-central1" }
+
+# Azure OpenAI (api-key header, deployment-based URL)
+[provider.azure]
+api_key = "${AZURE_OPENAI_KEY}"
+azure_openai = { resource_name = "my-resource", api_version = "2024-10-21" }
+
+# Google AI Studio (API key as query parameter)
+[provider.gemini]
+api_key = "${GEMINI_API_KEY}"
+google_ai = { api_version = "v1beta" }  # api_version defaults to v1beta
+
+# Anthropic (OpenAI compatibility endpoint)
+[provider.anthropic]
+api_key = "${ANTHROPIC_API_KEY}"
+anthropic = { version = "2023-06-01" }  # version defaults to 2023-06-01
+
+# Model map: aliases the client uses → provider+model candidates
+[model]
+fast = [
+  { provider = "groq", model = "llama-3.3-70b-versatile" },
+  { provider = "openai", model = "gpt-4o-mini" },
+]
+
+smart = [
+  { provider = "openai", model = "gpt-4.1" },
+  { provider = "vertex", model = "gemini-2.5-flash" },
+  { provider = "azure", model = "gpt-4o" },              # deployment name in Azure
+  { provider = "anthropic", model = "claude-sonnet-4-20250514" },
+  { provider = "local-vllm", model = "qwen3-32b" },
+]
+
+code = [
+  { provider = "openai", model = "gpt-4.1" },
+  { provider = "groq", model = "llama-3.3-70b-versatile" },
+  { provider = "local-vllm", model = "qwen-coder-32b" },
+]
+
+[routing]
+ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
+explore_ratio = 0.2        # fraction of traffic sent to cold candidates for latency exploration
+error_threshold = 0.5      # error rate above which a candidate is deprioritized
+error_decay_secs = 300     # time window for error rate calculation; old errors age out naturally
+connect_timeout_secs = 10  # max seconds to establish upstream connection
+read_timeout_secs = 60     # max seconds between chunks before treating upstream as hung
+session_ttl_secs = 1800    # sticky session TTL in seconds (default 30 min)

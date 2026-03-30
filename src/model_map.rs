@@ -1,4 +1,4 @@
-use crate::config::{Config, ModelCandidate, ProviderConfig};
+use crate::config::{Config, ModelCandidate};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,18 +28,12 @@ pub struct ModelMap {
 
 impl ModelMap {
     pub fn from_config(config: &Config) -> Self {
-        let providers: HashMap<&str, &ProviderConfig> = config
-            .providers
-            .iter()
-            .map(|p| (p.name.as_str(), p))
-            .collect();
-
         let mut aliases = HashMap::new();
-        for (alias, candidates) in &config.models {
+        for (alias, candidates) in &config.model {
             let resolved: Vec<ResolvedCandidate> = candidates
                 .iter()
                 .filter_map(|c: &ModelCandidate| {
-                    let prov = providers.get(c.provider.as_str())?;
+                    let prov = config.provider.get(&c.provider)?;
                     let kind = prov.resolved_kind();
                     Some(ResolvedCandidate {
                         provider_name: c.provider.clone(),
