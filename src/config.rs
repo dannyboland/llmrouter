@@ -7,8 +7,8 @@ use std::path::Path;
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
-    pub providers: Vec<ProviderConfig>,
-    pub models: HashMap<String, Vec<ModelCandidate>>,
+    pub provider: HashMap<String, ProviderConfig>,
+    pub model: HashMap<String, Vec<ModelCandidate>>,
     #[serde(default)]
     pub routing: RoutingConfig,
 }
@@ -19,7 +19,6 @@ fn default_listen() -> String {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ProviderConfig {
-    pub name: String,
     /// Base URL for the provider API. Optional if a provider shorthand is set.
     pub base_url: Option<String>,
     pub api_key: Option<String>,
@@ -161,10 +160,11 @@ impl Default for RoutingConfig {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {e}", path.display()))?;
         let interpolated =
             shellexpand::env(&raw).map_err(|e| anyhow::anyhow!("env var expansion failed: {e}"))?;
-        let config: Config = serde_yaml::from_str(&interpolated)?;
+        let config: Config = toml::from_str(&interpolated)?;
         config.validate()?;
         Ok(config)
     }
@@ -188,7 +188,7 @@ impl Config {
                 self.routing.error_threshold
             );
         }
-        for p in &self.providers {
+        for (name, p) in &self.provider {
             let shorthand_count = [
                 p.vertex_ai.is_some(),
                 p.azure_openai.is_some(),
@@ -201,7 +201,7 @@ impl Config {
             if shorthand_count > 1 {
                 anyhow::bail!(
                     "provider '{}' has multiple provider shorthands; use only one of vertex_ai, azure_openai, google_ai, or anthropic",
-                    p.name
+                    name
                 );
             }
             let base_url = match p.resolved_base_url() {
@@ -209,22 +209,21 @@ impl Config {
                 None => {
                     anyhow::bail!(
                         "provider '{}' must have base_url or a provider shorthand configured",
-                        p.name
+                        name
                     );
                 }
             };
             if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
                 anyhow::bail!(
                     "provider '{}' has invalid base_url (must start with http:// or https://): {}",
-                    p.name,
+                    name,
                     base_url
                 );
             }
         }
-        let provider_names: Vec<&str> = self.providers.iter().map(|p| p.name.as_str()).collect();
-        for (alias, candidates) in &self.models {
+        for (alias, candidates) in &self.model {
             for c in candidates {
-                if !provider_names.contains(&c.provider.as_str()) {
+                if !self.provider.contains_key(&c.provider) {
                     anyhow::bail!(
                         "model alias '{alias}' references unknown provider '{}'",
                         c.provider
@@ -243,7 +242,6 @@ mod tests {
     #[test]
     fn vertex_ai_derives_base_url() {
         let provider = ProviderConfig {
-            name: "vertex".into(),
             vertex_ai: Some(VertexAiConfig {
                 project_id: "my-project".into(),
                 location: "us-central1".into(),
@@ -259,7 +257,6 @@ mod tests {
     #[test]
     fn vertex_ai_defaults_to_gcp_metadata_auth() {
         let provider = ProviderConfig {
-            name: "vertex".into(),
             vertex_ai: Some(VertexAiConfig {
                 project_id: "p".into(),
                 location: "l".into(),
@@ -272,7 +269,6 @@ mod tests {
     #[test]
     fn api_key_provider_defaults_to_api_key_kind() {
         let provider = ProviderConfig {
-            name: "openai".into(),
             base_url: Some("https://api.openai.com/v1".into()),
             api_key: Some("sk-test".into()),
             ..Default::default()
@@ -286,96 +282,90 @@ mod tests {
 
     #[test]
     fn timeout_defaults_when_omitted() {
-        let yaml = r#"
-providers:
-  - name: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "sk-test"
-models:
-  fast:
-    - provider: openai
-      model: gpt-4o-mini
+        let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.routing.connect_timeout_secs, 10);
         assert_eq!(config.routing.read_timeout_secs, 60);
     }
 
     #[test]
     fn timeout_explicit_values_override_defaults() {
-        let yaml = r#"
-providers:
-  - name: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "sk-test"
-models:
-  fast:
-    - provider: openai
-      model: gpt-4o-mini
-routing:
-  connect_timeout_secs: 5
-  read_timeout_secs: 120
+        let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+
+[routing]
+connect_timeout_secs = 5
+read_timeout_secs = 120
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.routing.connect_timeout_secs, 5);
         assert_eq!(config.routing.read_timeout_secs, 120);
     }
 
     #[test]
     fn explore_ratio_rejects_negative() {
-        let yaml = r#"
-providers:
-  - name: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "sk-test"
-models:
-  fast:
-    - provider: openai
-      model: gpt-4o-mini
-routing:
-  explore_ratio: -0.1
+        let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+
+[routing]
+explore_ratio = -0.1
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn explore_ratio_rejects_greater_than_one() {
-        let yaml = r#"
-providers:
-  - name: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "sk-test"
-models:
-  fast:
-    - provider: openai
-      model: gpt-4o-mini
-routing:
-  explore_ratio: 1.5
+        let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+
+[routing]
+explore_ratio = 1.5
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn explore_ratio_accepts_valid_range() {
         for ratio in &[0.0, 0.2, 0.5, 1.0] {
-            let yaml = format!(
+            let toml_str = format!(
                 r#"
-providers:
-  - name: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "sk-test"
-models:
-  fast:
-    - provider: openai
-      model: gpt-4o-mini
-routing:
-  explore_ratio: {}
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{{ provider = "openai", model = "gpt-4o-mini" }}]
+
+[routing]
+explore_ratio = {}
 "#,
                 ratio
             );
-            let config: Config = serde_yaml::from_str(&yaml).unwrap();
+            let config: Config = toml::from_str(&toml_str).unwrap();
             assert!(
                 config.validate().is_ok(),
                 "explore_ratio {} should be valid",
@@ -387,7 +377,6 @@ routing:
     #[test]
     fn azure_openai_derives_base_url() {
         let provider = ProviderConfig {
-            name: "azure".into(),
             api_key: Some("key".into()),
             azure_openai: Some(AzureOpenAiConfig {
                 resource_name: "my-resource".into(),
@@ -402,7 +391,6 @@ routing:
     #[test]
     fn azure_openai_resolves_kind() {
         let provider = ProviderConfig {
-            name: "azure".into(),
             api_key: Some("key".into()),
             azure_openai: Some(AzureOpenAiConfig {
                 resource_name: "r".into(),
@@ -418,19 +406,17 @@ routing:
 
     #[test]
     fn google_ai_shorthand_derives_url_and_kind() {
-        let yaml = r#"
-providers:
-  - name: gemini
-    google_ai: {}
-    api_key: "key"
-models:
-  test:
-    - provider: gemini
-      model: gemini-2.5-flash
+        let toml_str = r#"
+[provider.gemini]
+api_key = "key"
+google_ai = {}
+
+[model]
+test = [{ provider = "gemini", model = "gemini-2.5-flash" }]
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_ok());
-        let p = &config.providers[0];
+        let p = &config.provider["gemini"];
         assert_eq!(
             p.resolved_base_url().unwrap(),
             "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -440,19 +426,17 @@ models:
 
     #[test]
     fn anthropic_shorthand_derives_url_and_kind() {
-        let yaml = r#"
-providers:
-  - name: anthropic
-    anthropic: {}
-    api_key: "key"
-models:
-  test:
-    - provider: anthropic
-      model: claude-sonnet-4-20250514
+        let toml_str = r#"
+[provider.anthropic]
+api_key = "key"
+anthropic = {}
+
+[model]
+test = [{ provider = "anthropic", model = "claude-sonnet-4-20250514" }]
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_ok());
-        let p = &config.providers[0];
+        let p = &config.provider["anthropic"];
         assert_eq!(
             p.resolved_base_url().unwrap(),
             "https://api.anthropic.com/v1"
@@ -462,18 +446,16 @@ models:
 
     #[test]
     fn rejects_multiple_provider_shorthands() {
-        let yaml = r#"
-providers:
-  - name: bad
-    google_ai: {}
-    anthropic: {}
-    api_key: "key"
-models:
-  test:
-    - provider: bad
-      model: test
+        let toml_str = r#"
+[provider.bad]
+api_key = "key"
+google_ai = {}
+anthropic = {}
+
+[model]
+test = [{ provider = "bad", model = "test" }]
 "#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
     }
 }

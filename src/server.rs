@@ -374,16 +374,14 @@ mod tests {
     use tokio::sync::oneshot;
 
     fn test_state() -> Arc<AppState> {
-        let config: crate::config::Config = serde_yaml::from_str(
+        let config: crate::config::Config = toml::from_str(
             r#"
-providers:
-  - name: test
-    base_url: "http://localhost:9999"
-    api_key: "fake"
-models:
-  fast:
-    - provider: test
-      model: test-model
+[provider.test]
+base_url = "http://localhost:9999"
+api_key = "fake"
+
+[model]
+fast = [{ provider = "test", model = "test-model" }]
 "#,
         )
         .unwrap();
@@ -391,7 +389,7 @@ models:
         let model_map = ModelMap::from_config(&config);
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
         let mut rr_state = RoundRobinState::new();
-        for (alias, candidates) in &config.models {
+        for (alias, candidates) in &config.model {
             rr_state.register_alias(alias.clone());
             for c in candidates {
                 tracker.register((c.provider.clone(), c.model.clone()));

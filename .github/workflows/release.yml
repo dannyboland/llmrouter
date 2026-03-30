@@ -45,14 +45,14 @@ jobs:
 
   build-linux:
     needs: validate
-    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            packages: musl-tools
+            runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
-            packages: musl-tools gcc-aarch64-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,12 +61,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
-      - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/llmrouter llmrouter-${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:

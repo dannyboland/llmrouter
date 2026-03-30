@@ -16,8 +16,8 @@ use llmrouter::tracker::Tracker;
 #[derive(Parser)]
 #[command(name = "llmrouter", about = "Lightweight LLM load-balancing sidecar")]
 struct Cli {
-    /// Path to config YAML file
-    #[arg(short, long, default_value = "config.yaml")]
+    /// Path to config TOML file
+    #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
 }
 
@@ -44,8 +44,8 @@ async fn main() -> anyhow::Result<()> {
 
     info!(listen = %config.listen, "starting llmrouter");
     info!(
-        providers = config.providers.len(),
-        models = config.models.len(),
+        providers = config.provider.len(),
+        models = config.model.len(),
         "loaded config"
     );
 
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let mut rr_state = RoundRobinState::new();
 
-    for (alias, candidates) in &config.models {
+    for (alias, candidates) in &config.model {
         rr_state.register_alias(alias.clone());
         for c in candidates {
             tracker_inner.register((c.provider.clone(), c.model.clone()));
@@ -77,8 +77,8 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let needs_gcp = config
-        .providers
-        .iter()
+        .provider
+        .values()
         .any(|p| p.resolved_kind() == ProviderKind::GcpMetadata);
     let gcp_token_provider = if needs_gcp {
         info!("GCP metadata auth enabled");
