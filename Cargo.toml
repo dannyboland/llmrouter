@@ -23,6 +23,7 @@ futures-util = "0.3"
 anyhow = "1"
 moka = { version = "0.12.15", features = ["sync"] }
 shellexpand = { version = "3", default-features = false, features = ["base-0"] }
+prometheus = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

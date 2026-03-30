@@ -1,5 +1,6 @@
 pub mod config;
 pub mod gcp_auth;
+pub mod metrics;
 pub mod model_map;
 pub mod proxy;
 pub mod router;

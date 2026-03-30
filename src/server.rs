@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 use crate::gcp_auth::GcpTokenProvider;
+use crate::metrics::Metrics;
 use crate::model_map::ModelMap;
 use crate::proxy;
 use crate::router::{self, candidate_key, RoundRobinState};
@@ -27,6 +28,7 @@ pub struct AppState {
     pub gcp_token_provider: Option<Arc<GcpTokenProvider>>,
     pub session_store: SessionStore,
     pub max_body_bytes: usize,
+    pub metrics: Metrics,
 }
 
 type BoxBody = http_body_util::Either<
@@ -70,6 +72,28 @@ pub async fn handle_request(
         }
         if path == "/status" {
             return Ok(build_status_response(&state));
+        }
+        if path == "/metrics" {
+            return match state.metrics.encode() {
+                Ok(buf) => {
+                    let body = Bytes::from(buf);
+                    let resp = Response::builder()
+                        .status(200)
+                        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                        .body(http_body_util::Either::Left(http_body_util::Full::new(
+                            body,
+                        )))
+                        .unwrap();
+                    Ok(resp)
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to encode metrics");
+                    Ok(json_error(
+                        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to encode metrics",
+                    ))
+                }
+            };
         }
         return Ok(json_error(hyper::StatusCode::NOT_FOUND, "not found"));
     }
@@ -194,6 +218,23 @@ pub async fn handle_request(
                 state.tracker.record_error(&key);
             }
 
+            let status_str = proxy_result.status.as_u16().to_string();
+            state
+                .metrics
+                .requests_total
+                .with_label_values(&[
+                    &alias,
+                    &candidate.provider_name,
+                    &candidate.model,
+                    &status_str,
+                ])
+                .inc();
+            state
+                .metrics
+                .ttfc_seconds
+                .with_label_values(&[&alias, &candidate.provider_name, &candidate.model])
+                .observe(proxy_result.ttfc.as_secs_f64());
+
             debug!(
                 provider = %candidate.provider_name,
                 model = %candidate.model,
@@ -223,6 +264,11 @@ pub async fn handle_request(
             );
 
             state.tracker.record_error(&key);
+            state
+                .metrics
+                .errors_total
+                .with_label_values(&[&alias, &candidate.provider_name, &candidate.model])
+                .inc();
 
             Ok(json_error(
                 hyper::StatusCode::BAD_GATEWAY,
@@ -320,6 +366,7 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Metrics;
     use crate::model_map::ModelMap;
     use crate::router::RoundRobinState;
     use crate::session::SessionStore;
@@ -360,6 +407,7 @@ models:
             gcp_token_provider: None,
             session_store: SessionStore::new(std::time::Duration::from_secs(1800), 100_000),
             max_body_bytes: 100 * 1024 * 1024,
+            metrics: Metrics::new(),
         })
     }
 
@@ -376,6 +424,54 @@ models:
 
         let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_text() {
+        let state = test_state();
+
+        state
+            .metrics
+            .requests_total
+            .with_label_values(&["fast", "test", "test-model", "200"])
+            .inc();
+        state
+            .metrics
+            .ttfc_seconds
+            .with_label_values(&["fast", "test", "test-model"])
+            .observe(0.1);
+        state
+            .metrics
+            .errors_total
+            .with_label_values(&["fast", "test", "test-model"])
+            .inc();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        tokio::spawn(run_server(listener, state, async {
+            let _ = rx.await;
+        }));
+
+        let resp = reqwest::get(format!("http://{addr}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "expected text/plain content-type, got {content_type}"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("llmrouter_requests_total"));
+        assert!(body.contains("llmrouter_ttfc_seconds"));
+        assert!(body.contains("llmrouter_errors_total"));
     }
 
     #[tokio::test]

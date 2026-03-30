@@ -1,0 +1,107 @@
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+};
+
+pub struct Metrics {
+    registry: Registry,
+    pub requests_total: IntCounterVec,
+    pub ttfc_seconds: HistogramVec,
+    pub errors_total: IntCounterVec,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        let registry = Registry::new();
+
+        let requests_total = IntCounterVec::new(
+            Opts::new("llmrouter_requests_total", "Total upstream requests"),
+            &["alias", "provider", "model", "status_code"],
+        )
+        .expect("valid metric descriptor");
+
+        let ttfc_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "llmrouter_ttfc_seconds",
+                "Time to first chunk from upstream",
+            )
+            .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
+            &["alias", "provider", "model"],
+        )
+        .expect("valid metric descriptor");
+
+        let errors_total = IntCounterVec::new(
+            Opts::new(
+                "llmrouter_errors_total",
+                "Connection failures before reaching upstream",
+            ),
+            &["alias", "provider", "model"],
+        )
+        .expect("valid metric descriptor");
+
+        registry
+            .register(Box::new(requests_total.clone()))
+            .expect("unique metric name");
+        registry
+            .register(Box::new(ttfc_seconds.clone()))
+            .expect("unique metric name");
+        registry
+            .register(Box::new(errors_total.clone()))
+            .expect("unique metric name");
+
+        Self {
+            registry,
+            requests_total,
+            ttfc_seconds,
+            errors_total,
+        }
+    }
+
+    /// Zero-init error counters so a missing series isn't mistaken for "no errors".
+    pub fn init_zero(&self, aliases: &[(String, String, String)]) {
+        for (alias, provider, model) in aliases {
+            self.errors_total
+                .with_label_values(&[alias, provider, model]);
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {
+        let encoder = TextEncoder::new();
+        let metric_families = self.registry.gather();
+        let mut buf = Vec::new();
+        encoder.encode(&metric_families, &mut buf)?;
+        Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_returns_valid_prometheus_text() {
+        let m = Metrics::new();
+        m.requests_total
+            .with_label_values(&["fast", "openai", "gpt-4o-mini", "200"])
+            .inc();
+        m.ttfc_seconds
+            .with_label_values(&["fast", "openai", "gpt-4o-mini"])
+            .observe(0.42);
+        m.errors_total
+            .with_label_values(&["fast", "groq", "llama-3"])
+            .inc();
+
+        let output = String::from_utf8(m.encode().unwrap()).unwrap();
+        assert!(output.contains("llmrouter_requests_total"));
+        assert!(output.contains("llmrouter_ttfc_seconds"));
+        assert!(output.contains("llmrouter_errors_total"));
+        assert!(output.contains("alias=\"fast\""));
+        assert!(output.contains("provider=\"openai\""));
+        assert!(output.contains("status_code=\"200\""));
+    }
+}
