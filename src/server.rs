@@ -4,10 +4,12 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
@@ -29,6 +31,7 @@ pub struct AppState {
     pub session_store: SessionStore,
     pub max_body_bytes: usize,
     pub metrics: Metrics,
+    pub shutting_down: AtomicBool,
 }
 
 type BoxBody = http_body_util::Either<
@@ -67,6 +70,10 @@ pub async fn handle_request(
     // GET endpoints
     if method == hyper::Method::GET {
         if path == "/health" || path == "/healthz" {
+            if state.shutting_down.load(Ordering::Relaxed) {
+                let body = Bytes::from(r#"{"status":"shutting_down"}"#);
+                return Ok(json_response(503, body));
+            }
             let body = Bytes::from(r#"{"status":"ok"}"#);
             return Ok(json_response(200, body));
         }
@@ -292,7 +299,9 @@ pub async fn run_server(
     listener: TcpListener,
     state: Arc<AppState>,
     shutdown: impl Future<Output = ()>,
+    shutdown_timeout: Duration,
 ) {
+    let graceful = GracefulShutdown::new();
     tokio::pin!(shutdown);
 
     loop {
@@ -308,16 +317,16 @@ pub async fn run_server(
                 let io = TokioIo::new(stream);
                 let state = state.clone();
 
-                tokio::spawn(async move {
-                    let service = service_fn(move |req| {
+                let conn = http1::Builder::new()
+                    .serve_connection(io, service_fn(move |req| {
                         let state = state.clone();
                         async move { handle_request(req, state).await }
-                    });
+                    }));
 
-                    if let Err(e) = http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await
-                    {
+                let conn = graceful.watch(conn);
+
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
                         if !e.to_string().contains("connection closed") {
                             error!(remote = %remote, error = %e, "connection error");
                         }
@@ -325,9 +334,22 @@ pub async fn run_server(
                 });
             }
             _ = &mut shutdown => {
-                info!("shutdown signal received, stopping accept loop");
+                info!("shutting down, draining connections");
+                state.shutting_down.store(true, Ordering::Relaxed);
                 break;
             }
+        }
+    }
+
+    drop(listener);
+
+    let drain = graceful.shutdown();
+    tokio::select! {
+        _ = drain => {
+            info!("all connections drained");
+        }
+        _ = tokio::time::sleep(shutdown_timeout) => {
+            warn!(timeout_secs = shutdown_timeout.as_secs(), "drain timeout reached, dropping remaining connections");
         }
     }
 }
@@ -373,17 +395,17 @@ mod tests {
     use crate::tracker::Tracker;
     use tokio::sync::oneshot;
 
-    fn test_state() -> Arc<AppState> {
-        let config: crate::config::Config = toml::from_str(
+    fn test_state_with_upstream(upstream_port: u16) -> Arc<AppState> {
+        let config: crate::config::Config = toml::from_str(&format!(
             r#"
 [provider.test]
-base_url = "http://localhost:9999"
+base_url = "http://127.0.0.1:{upstream_port}"
 api_key = "fake"
 
 [model]
-fast = [{ provider = "test", model = "test-model" }]
+fast = [{{ provider = "test", model = "test-model" }}]
 "#,
-        )
+        ))
         .unwrap();
 
         let model_map = ModelMap::from_config(&config);
@@ -406,7 +428,12 @@ fast = [{ provider = "test", model = "test-model" }]
             session_store: SessionStore::new(std::time::Duration::from_secs(1800), 100_000),
             max_body_bytes: 100 * 1024 * 1024,
             metrics: Metrics::new(),
+            shutting_down: AtomicBool::new(false),
         })
+    }
+
+    fn test_state() -> Arc<AppState> {
+        test_state_with_upstream(9999)
     }
 
     #[tokio::test]
@@ -416,9 +443,14 @@ fast = [{ provider = "test", model = "test-model" }]
         let addr = listener.local_addr().unwrap();
         let (_tx, rx) = oneshot::channel::<()>();
 
-        tokio::spawn(run_server(listener, state, async {
-            let _ = rx.await;
-        }));
+        tokio::spawn(run_server(
+            listener,
+            state,
+            async {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+        ));
 
         let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -448,9 +480,14 @@ fast = [{ provider = "test", model = "test-model" }]
         let addr = listener.local_addr().unwrap();
         let (_tx, rx) = oneshot::channel::<()>();
 
-        tokio::spawn(run_server(listener, state, async {
-            let _ = rx.await;
-        }));
+        tokio::spawn(run_server(
+            listener,
+            state,
+            async {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+        ));
 
         let resp = reqwest::get(format!("http://{addr}/metrics"))
             .await
@@ -479,9 +516,14 @@ fast = [{ provider = "test", model = "test-model" }]
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel::<()>();
 
-        let server_handle = tokio::spawn(run_server(listener, state, async {
-            let _ = rx.await;
-        }));
+        let server_handle = tokio::spawn(run_server(
+            listener,
+            state,
+            async {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+        ));
 
         // Confirm server is up
         let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
@@ -502,5 +544,149 @@ fast = [{ provider = "test", model = "test-model" }]
             result.is_err(),
             "expected connection refused after shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn health_returns_503_during_shutdown() {
+        let state = test_state();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        // Mark as shutting down before starting so we can test the endpoint
+        state.shutting_down.store(true, Ordering::Relaxed);
+
+        tokio::spawn(run_server(
+            listener,
+            state,
+            async {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+
+        let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "shutting_down");
+    }
+
+    /// Mock upstream that accepts one request, waits for a signal, then responds.
+    async fn slow_upstream() -> (u16, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = conn.read(&mut buf).await.unwrap();
+            let _ = rx.await;
+            conn.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":\"ok\"}"
+            ).await.unwrap();
+        });
+        (port, tx, handle)
+    }
+
+    /// Mock upstream that accepts one request and never responds.
+    async fn hanging_upstream() -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = conn.read(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(conn);
+        });
+        (port, handle)
+    }
+
+    fn proxy_request(
+        addr: std::net::SocketAddr,
+    ) -> tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>> {
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .json(&serde_json::json!({"model": "fast", "messages": []}))
+                .send()
+                .await
+        })
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_waits_for_inflight_request() {
+        let (mock_port, upstream_tx, mock_handle) = slow_upstream().await;
+        let state = test_state_with_upstream(mock_port);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let mut server_handle = tokio::spawn(run_server(
+            listener,
+            state,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_secs(5),
+        ));
+
+        let client_handle = proxy_request(addr);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(()).unwrap();
+
+        // Server should still be draining
+        let poll = tokio::time::timeout(Duration::from_millis(500), &mut server_handle).await;
+        assert!(
+            poll.is_err(),
+            "server exited while request was still in flight"
+        );
+
+        // Release the upstream; request completes, server exits
+        upstream_tx.send(()).unwrap();
+        let resp = client_handle.await.unwrap().unwrap();
+        assert_eq!(resp.status(), 200);
+
+        tokio::time::timeout(Duration::from_secs(2), server_handle)
+            .await
+            .expect("server did not shut down after drain")
+            .expect("server task panicked");
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_timeout_force_exits() {
+        let (mock_port, mock_handle) = hanging_upstream().await;
+        let state = test_state_with_upstream(mock_port);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let server_handle = tokio::spawn(run_server(
+            listener,
+            state,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(300),
+        ));
+
+        let client_handle = proxy_request(addr);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(()).unwrap();
+
+        // Server should exit after drain timeout despite hanging upstream
+        tokio::time::timeout(Duration::from_secs(3), server_handle)
+            .await
+            .expect("server did not exit after drain timeout")
+            .expect("server task panicked");
+
+        mock_handle.abort();
+        client_handle.abort();
     }
 }
