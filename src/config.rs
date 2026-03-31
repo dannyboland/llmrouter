@@ -139,6 +139,7 @@ pub struct RoutingConfig {
     pub max_body_bytes: usize,
     pub max_sessions: u64,
     pub max_error_window_entries: usize,
+    pub shutdown_timeout_secs: u64,
 }
 
 impl Default for RoutingConfig {
@@ -154,6 +155,7 @@ impl Default for RoutingConfig {
             max_body_bytes: 100 * 1024 * 1024, // 100 MB
             max_sessions: 100_000,
             max_error_window_entries: 10_000,
+            shutdown_timeout_secs: 30,
         }
     }
 }

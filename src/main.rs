@@ -1,6 +1,7 @@
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -108,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     metrics.init_zero(&label_triples);
 
+    let shutdown_timeout = std::time::Duration::from_secs(config.routing.shutdown_timeout_secs);
+
     let state = Arc::new(AppState {
         model_map,
         tracker: tracker_inner,
@@ -118,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         session_store,
         max_body_bytes,
         metrics,
+        shutting_down: AtomicBool::new(false),
     });
 
     let addr: SocketAddr = config.listen.parse()?;
@@ -134,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         info!("received shutdown signal");
     };
 
-    llmrouter::server::run_server(listener, state, shutdown).await;
+    llmrouter::server::run_server(listener, state, shutdown, shutdown_timeout).await;
 
     info!("server stopped");
     Ok(())
