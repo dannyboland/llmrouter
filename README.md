@@ -74,7 +74,7 @@ fast = [
 
 smart = [
   { provider = "openai", model = "gpt-4.1" },
-  { provider = "vertex", model = "gemini-2.5-flash" },
+  { provider = "vertex", model = "google/gemini-2.5-flash" },
 ]
 
 [routing]
