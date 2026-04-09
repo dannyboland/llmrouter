@@ -135,9 +135,7 @@ pub struct RoutingConfig {
     pub error_decay_secs: u64,
     pub connect_timeout_secs: u64,
     pub read_timeout_secs: u64,
-    pub session_ttl_secs: u64,
     pub max_body_bytes: usize,
-    pub max_sessions: u64,
     pub max_error_window_entries: usize,
     pub shutdown_timeout_secs: u64,
 }
@@ -151,9 +149,7 @@ impl Default for RoutingConfig {
             error_decay_secs: 300,
             connect_timeout_secs: 10,
             read_timeout_secs: 60,
-            session_ttl_secs: 1800,
             max_body_bytes: 100 * 1024 * 1024, // 100 MB
-            max_sessions: 100_000,
             max_error_window_entries: 10_000,
             shutdown_timeout_secs: 30,
         }
