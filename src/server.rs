@@ -18,7 +18,6 @@ use crate::metrics::Metrics;
 use crate::model_map::ModelMap;
 use crate::proxy;
 use crate::router::{self, candidate_key, RoundRobinState};
-use crate::session::SessionStore;
 use crate::tracker::Tracker;
 
 pub struct AppState {
@@ -28,7 +27,6 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub explore_ratio: f64,
     pub gcp_token_provider: Option<Arc<GcpTokenProvider>>,
-    pub session_store: SessionStore,
     pub max_body_bytes: usize,
     pub metrics: Metrics,
     pub shutting_down: AtomicBool,
@@ -112,11 +110,14 @@ pub async fn handle_request(
         ));
     }
 
-    let session_id = req
+    let affinity = req
         .headers()
-        .get("x-session-id")
+        .get("x-session-affinity")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|v| {
+            let (provider, model) = v.split_once('/')?;
+            Some((provider.to_string(), model.to_string()))
+        });
 
     let max_body = state.max_body_bytes;
     let body_bytes = match Limited::new(req, max_body).collect().await {
@@ -154,25 +155,21 @@ pub async fn handle_request(
         }
     };
 
-    let pinned = session_id.as_ref().and_then(|sid| {
-        state.session_store.get(&alias, sid).and_then(|pinned_key| {
-            let found = candidates
-                .iter()
-                .find(|c| candidate_key(c) == pinned_key)?;
-            if state.tracker.is_degraded(&pinned_key) {
-                debug!(session_id = %sid, provider = %pinned_key.0, "previous model in session now degraded, breaking affinity");
-                state.session_store.remove(&alias, sid);
-                None
-            } else {
-                Some(found)
-            }
-        })
+    let pinned = affinity.as_ref().and_then(|(provider, model)| {
+        let key = (provider.clone(), model.clone());
+        let found = candidates.iter().find(|c| candidate_key(c) == key)?;
+        if state.tracker.is_degraded(&key) {
+            debug!(provider = %provider, model = %model, "affinity provider degraded, re-routing");
+            None
+        } else {
+            Some(found)
+        }
     });
 
     let candidate = if let Some(c) = pinned {
         c
     } else {
-        let c = match router::select_candidate(
+        match router::select_candidate(
             &alias,
             candidates,
             &state.tracker,
@@ -186,11 +183,7 @@ pub async fn handle_request(
                     &format!("no healthy candidate for model alias '{alias}'"),
                 ));
             }
-        };
-        if let Some(ref sid) = session_id {
-            state.session_store.insert(&alias, sid, candidate_key(c));
         }
-        c
     };
 
     let key = candidate_key(candidate);
@@ -255,9 +248,10 @@ pub async fn handle_request(
                 builder = builder.header(k, v);
             }
             builder = builder.header("x-llmrouter-provider", &candidate.provider_name);
-            if let Some(ref sid) = session_id {
-                builder = builder.header("x-llmrouter-session-id", sid.as_str());
-            }
+            builder = builder.header(
+                "x-session-affinity",
+                format!("{}/{}", candidate.provider_name, candidate.model),
+            );
 
             let body = proxy::into_hyper_body(proxy_result.body);
             Ok(builder.body(body).unwrap())
@@ -379,7 +373,6 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
 
     let body = serde_json::json!({
         "candidates": candidates,
-        "active_sessions": state.session_store.len(),
     });
     let bytes = Bytes::from(serde_json::to_vec_pretty(&body).unwrap());
     json_response(200, bytes)
@@ -391,7 +384,6 @@ mod tests {
     use crate::metrics::Metrics;
     use crate::model_map::ModelMap;
     use crate::router::RoundRobinState;
-    use crate::session::SessionStore;
     use crate::tracker::Tracker;
     use tokio::sync::oneshot;
 
@@ -425,7 +417,6 @@ fast = [{{ provider = "test", model = "test-model" }}]
             client: reqwest::Client::new(),
             explore_ratio: 0.2,
             gcp_token_provider: None,
-            session_store: SessionStore::new(std::time::Duration::from_secs(1800), 100_000),
             max_body_bytes: 100 * 1024 * 1024,
             metrics: Metrics::new(),
             shutting_down: AtomicBool::new(false),
@@ -688,5 +679,182 @@ fast = [{{ provider = "test", model = "test-model" }}]
 
         mock_handle.abort();
         client_handle.abort();
+    }
+
+    /// Mock upstream that accepts N requests and responds immediately.
+    async fn instant_upstream(n: usize) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            for _ in 0..n {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = conn.read(&mut buf).await.unwrap();
+                conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":\"ok\"}",
+                )
+                .await
+                .unwrap();
+            }
+        });
+        (port, handle)
+    }
+
+    fn start_server(
+        state: Arc<AppState>,
+    ) -> (
+        std::net::SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(run_server(
+            listener,
+            state,
+            async {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+        (addr, tx, handle)
+    }
+
+    #[tokio::test]
+    async fn response_includes_session_affinity_header() {
+        let (mock_port, mock_handle) = instant_upstream(1).await;
+        let state = test_state_with_upstream(mock_port);
+        let (addr, _tx, _server) = start_server(state);
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let affinity = resp
+            .headers()
+            .get("x-session-affinity")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(affinity, "test/test-model");
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn affinity_header_pins_to_candidate() {
+        // Two distinct upstreams for the same model alias
+        let (port_a, handle_a) = instant_upstream(1).await;
+        let (port_b, handle_b) = instant_upstream(0).await;
+
+        let config: crate::config::Config = toml::from_str(&format!(
+            r#"
+[provider.alpha]
+base_url = "http://127.0.0.1:{port_a}"
+api_key = "fake"
+
+[provider.beta]
+base_url = "http://127.0.0.1:{port_b}"
+api_key = "fake"
+
+[model]
+fast = [
+  {{ provider = "alpha", model = "test-model" }},
+  {{ provider = "beta",  model = "test-model" }},
+]
+"#,
+        ))
+        .unwrap();
+
+        let model_map = ModelMap::from_config(&config);
+        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let mut rr_state = RoundRobinState::new();
+        for (alias, candidates) in &config.model {
+            rr_state.register_alias(alias.clone());
+            for c in candidates {
+                tracker.register((c.provider.clone(), c.model.clone()));
+            }
+        }
+
+        // Make beta look fast (10ms) and alpha slow (500ms) so the router
+        // naturally prefers beta. We then pin affinity to alpha and verify
+        // the router honours the pin instead of picking beta.
+        let alpha_key = ("alpha".to_string(), "test-model".to_string());
+        let beta_key = ("beta".to_string(), "test-model".to_string());
+        tracker.record_ttfc(&alpha_key, Duration::from_millis(500));
+        tracker.record_success(&alpha_key);
+        tracker.record_ttfc(&beta_key, Duration::from_millis(10));
+        tracker.record_success(&beta_key);
+
+        let state = Arc::new(AppState {
+            model_map,
+            tracker,
+            rr_state,
+            client: reqwest::Client::new(),
+            explore_ratio: 0.0,
+            gcp_token_provider: None,
+            max_body_bytes: 100 * 1024 * 1024,
+            metrics: Metrics::new(),
+            shutting_down: AtomicBool::new(false),
+        });
+        let (addr, _tx, _server) = start_server(state);
+        let client = reqwest::Client::new();
+
+        // Pin affinity to the slow provider (alpha)
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("x-session-affinity", "alpha/test-model")
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let provider = resp
+            .headers()
+            .get("x-llmrouter-provider")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            provider, "alpha",
+            "affinity should pin to alpha even though beta is faster"
+        );
+
+        handle_a.abort();
+        handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_affinity_header_ignored() {
+        let (mock_port, mock_handle) = instant_upstream(1).await;
+        let state = test_state_with_upstream(mock_port);
+        let (addr, _tx, _server) = start_server(state);
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("x-session-affinity", "garbage")
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let affinity = resp
+            .headers()
+            .get("x-session-affinity")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(affinity, "test/test-model");
+
+        mock_handle.abort();
     }
 }

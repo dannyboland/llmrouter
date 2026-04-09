@@ -1,6 +1,6 @@
 [package]
 name = "llmrouter"
-version = "2.1.0"
+version = "3.0.0"
 edition = "2021"
 authors = ["Danny Boland <danny@boland.dev>"]
 license = "MIT"
@@ -21,7 +21,6 @@ clap = { version = "4", features = ["derive"] }
 bytes = "1"
 futures-util = "0.3"
 anyhow = "1"
-moka = { version = "0.12", features = ["sync"] }
 shellexpand = { version = "3", default-features = false, features = ["base-0"] }
 prometheus = { version = "0.14", default-features = false }
 

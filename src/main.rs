@@ -11,7 +11,6 @@ use llmrouter::metrics::Metrics;
 use llmrouter::model_map::{ModelMap, ProviderKind};
 use llmrouter::router::RoundRobinState;
 use llmrouter::server::AppState;
-use llmrouter::session::SessionStore;
 use llmrouter::tracker::Tracker;
 
 #[derive(Parser)]
@@ -90,10 +89,6 @@ async fn main() -> anyhow::Result<()> {
 
     let explore_ratio = config.routing.explore_ratio;
     let max_body_bytes = config.routing.max_body_bytes;
-    let session_store = SessionStore::new(
-        std::time::Duration::from_secs(config.routing.session_ttl_secs),
-        config.routing.max_sessions,
-    );
 
     let metrics = Metrics::new();
     let label_triples: Vec<_> = model_map
@@ -118,7 +113,6 @@ async fn main() -> anyhow::Result<()> {
         client,
         explore_ratio,
         gcp_token_provider,
-        session_store,
         max_body_bytes,
         metrics,
         shutting_down: AtomicBool::new(false),

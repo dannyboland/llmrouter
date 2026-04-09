@@ -9,7 +9,7 @@ LLM providers have variable latency and availability that can break production f
 - **Latency-based routing** — tracks EWMA of time-to-first-chunk per (provider, model) and routes to the fastest candidate
 - **Explore/exploit** — configurable fraction of traffic round-robins across all healthy candidates, discovering cold providers and re-sampling warm ones to detect latency changes
 - **Error rate tracking** — time-based sliding window deprioritizes failing candidates; degraded candidates are excluded from traffic until errors age out
-- **Session affinity** — optional `x-session-id` header pins requests to the same provider for the duration of a session, with automatic fallback on degradation
+- **Session affinity** — stateless `x-session-affinity` header pins subsequent requests to the same provider, works across pods with no shared state, with automatic fallback on degradation
 - **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive with no buffering
 - **Vertex AI support** — GKE Workload Identity auth via metadata server with automatic token refresh
 - **Zero infrastructure** — single static binary, no Redis/database/control plane
@@ -82,7 +82,6 @@ ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
 explore_ratio = 0.2        # fraction of traffic that round-robins across all healthy candidates
 error_threshold = 0.5      # error rate above which a candidate is excluded
 error_decay_secs = 300     # time window for error rate calculation; old errors age out naturally
-session_ttl_secs = 1800    # sticky session TTL in seconds (default 30 min)
 ```
 
 Environment variables in `${VAR}` syntax are interpolated at config load time.
@@ -99,19 +98,23 @@ Environment variables in `${VAR}` syntax are interpolated at config load time.
 
 ## Session affinity
 
-Pass `x-session-id` to pin a session to the same provider — useful for multi-turn conversations where context is provider-specific:
+Every response includes an `x-session-affinity` header (e.g. `openai/gpt-4o-mini`). Pass it back on subsequent requests to pin to the same provider — useful for multi-turn conversations where context is provider-specific:
 
 ```python
 response = client.chat.completions.create(
     model="smart",
     messages=[{"role": "user", "content": "Hello"}],
-    extra_headers={"x-session-id": "conv-abc-123"},
 )
-# All subsequent requests with x-session-id: conv-abc-123 go to the same provider.
-# The response includes x-llmrouter-provider and x-llmrouter-session-id headers.
+affinity = response.headers["x-session-affinity"]  # e.g. "openai/gpt-4o-mini"
+
+response = client.chat.completions.create(
+    model="smart",
+    messages=[{"role": "user", "content": "Follow-up"}],
+    extra_headers={"x-session-affinity": affinity},
+)
 ```
 
-Sessions expire after `session_ttl_secs` (default 30 min) of inactivity. If the pinned provider degrades, affinity breaks automatically and a new provider is selected.
+Fully stateless — works across pods with no shared state. If the pinned provider degrades, the header is ignored and a new provider is selected (check the updated `x-session-affinity` in the response).
 
 ## How routing works
 
