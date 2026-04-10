@@ -1,4 +1,8 @@
+FROM debian:bookworm-slim AS certs
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
+
 FROM scratch
 ARG TARGETARCH
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY llmrouter-${TARGETARCH} /llmrouter
 ENTRYPOINT ["/llmrouter"]
