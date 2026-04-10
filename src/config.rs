@@ -177,7 +177,6 @@ impl Config {
     }
 
     /// Load env vars from a directory of secret files (filename = key, content = value).
-    /// Compatible with Kubernetes Secrets Store CSI driver volumes.
     /// Overwrites existing env vars so mounted secrets take precedence.
     /// Skips hidden files and subdirectories.
     pub fn load_env_dir(dir: &Path) -> anyhow::Result<()> {

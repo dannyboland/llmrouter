@@ -88,19 +88,12 @@ Environment variables in `${VAR}` syntax are interpolated at config load time.
 
 ### Loading secrets
 
-For environments where environment variables aren't easy to set (e.g. scratch Docker images), llmrouter can load them from files:
+Where environment variables are available in an .env file, this can be passed with `--env-file`:
 
 ```bash
 # Single .env file (KEY=VALUE per line)
 llmrouter --env-file /secrets/.env
-
-# Directory of secret files (one file per variable, filename = key)
-llmrouter --env-dir /secrets/
 ```
-
-`--env-dir` is compatible with the [Kubernetes Secrets Store CSI driver](https://secrets-store-csi-driver.sigs.k8s.io/) used by GCP Secret Manager, AWS Secrets Manager, and HashiCorp Vault. Each file in the directory becomes an environment variable.
-
-Both flags load variables before config parsing, so `${VAR}` references in the TOML config resolve correctly. When both are used, precedence is: `--env-dir` > `--env-file` > process environment.
 
 ## Endpoints
 
@@ -150,7 +143,7 @@ docker run -v ./config.toml:/config.toml \
   ghcr.io/dannyboland/llmrouter:latest
 ```
 
-To inject secrets via a mounted `.env` file or secrets directory:
+To inject secrets via a mounted `.env` file:
 
 ```bash
 # .env file
@@ -158,12 +151,6 @@ docker run -v ./config.toml:/config.toml \
   -v ./secrets.env:/secrets/.env:ro \
   -p 4000:4000 \
   ghcr.io/dannyboland/llmrouter:latest --env-file /secrets/.env
-
-# Secret directory (e.g. from Secrets Store CSI)
-docker run -v ./config.toml:/config.toml \
-  -v ./secrets/:/secrets/:ro \
-  -p 4000:4000 \
-  ghcr.io/dannyboland/llmrouter:latest --env-dir /secrets/
 ```
 
 When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
