@@ -86,6 +86,15 @@ error_decay_secs = 300     # time window for error rate calculation; old errors 
 
 Environment variables in `${VAR}` syntax are interpolated at config load time.
 
+### Loading secrets
+
+Where environment variables are available in an .env file, this can be passed with `--env-file`:
+
+```bash
+# Single .env file (KEY=VALUE per line)
+llmrouter --env-file /secrets/.env
+```
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -132,6 +141,16 @@ Fully stateless — works across pods with no shared state. If the pinned provid
 docker run -v ./config.toml:/config.toml \
   -p 4000:4000 \
   ghcr.io/dannyboland/llmrouter:latest
+```
+
+To inject secrets via a mounted `.env` file:
+
+```bash
+# .env file
+docker run -v ./config.toml:/config.toml \
+  -v ./secrets.env:/secrets/.env:ro \
+  -p 4000:4000 \
+  ghcr.io/dannyboland/llmrouter:latest --env-file /secrets/.env
 ```
 
 When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.

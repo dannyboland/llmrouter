@@ -170,6 +170,34 @@ impl Config {
         Ok(config)
     }
 
+    /// Load a `.env` file into process env vars (does not overwrite existing).
+    pub fn load_env_file(path: &Path) -> anyhow::Result<()> {
+        dotenvy::from_path(path)?;
+        Ok(())
+    }
+
+    /// Load env vars from a directory of secret files (filename = key, content = value).
+    /// Overwrites existing env vars so mounted secrets take precedence.
+    /// Skips hidden files and subdirectories.
+    pub fn load_env_dir(dir: &Path) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() && !entry.file_type()?.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name();
+            let key = name
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", entry.path().display()))?;
+            if key.starts_with('.') {
+                continue;
+            }
+            let val = std::fs::read_to_string(entry.path())?;
+            std::env::set_var(key, val.trim_end_matches('\n'));
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         if !(0.0..=1.0).contains(&self.routing.ewma_alpha) {
             anyhow::bail!(
@@ -474,5 +502,54 @@ test = [{ provider = "bad", model = "test" }]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    mod env_dir {
+        use super::*;
+        use std::io::Write;
+
+        fn tmp_secret_dir(entries: &[(&str, &str)]) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            for (name, value) in entries {
+                let mut f = std::fs::File::create(dir.path().join(name)).unwrap();
+                f.write_all(value.as_bytes()).unwrap();
+            }
+            dir
+        }
+
+        #[test]
+        fn reads_files_as_env_vars() {
+            let dir = tmp_secret_dir(&[("TEST_DIR_A", "secret-a")]);
+            Config::load_env_dir(dir.path()).unwrap();
+            assert_eq!(std::env::var("TEST_DIR_A").unwrap(), "secret-a");
+            std::env::remove_var("TEST_DIR_A");
+        }
+
+        #[test]
+        fn trims_trailing_newline() {
+            let dir = tmp_secret_dir(&[("TEST_DIR_TRIM", "secret\n")]);
+            Config::load_env_dir(dir.path()).unwrap();
+            assert_eq!(std::env::var("TEST_DIR_TRIM").unwrap(), "secret");
+            std::env::remove_var("TEST_DIR_TRIM");
+        }
+
+        #[test]
+        fn overwrites_existing() {
+            std::env::set_var("TEST_DIR_OVER", "original");
+            let dir = tmp_secret_dir(&[("TEST_DIR_OVER", "rotated")]);
+            Config::load_env_dir(dir.path()).unwrap();
+            assert_eq!(std::env::var("TEST_DIR_OVER").unwrap(), "rotated");
+            std::env::remove_var("TEST_DIR_OVER");
+        }
+
+        #[test]
+        fn skips_hidden_files_and_subdirs() {
+            let dir = tmp_secret_dir(&[(".hidden", "nope"), ("TEST_DIR_VIS", "yes")]);
+            std::fs::create_dir(dir.path().join("subdir")).unwrap();
+            Config::load_env_dir(dir.path()).unwrap();
+            assert!(std::env::var(".hidden").is_err());
+            assert_eq!(std::env::var("TEST_DIR_VIS").unwrap(), "yes");
+            std::env::remove_var("TEST_DIR_VIS");
+        }
     }
 }
