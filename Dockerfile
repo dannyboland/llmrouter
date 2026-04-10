@@ -11,5 +11,6 @@ COPY benches/ benches/
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
 FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/llmrouter /llmrouter
 ENTRYPOINT ["/llmrouter"]
