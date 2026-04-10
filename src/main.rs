@@ -19,6 +19,14 @@ struct Cli {
     /// Path to config TOML file
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Load a .env file into process env vars before reading config
+    #[arg(short, long = "env-file")]
+    env_file: Option<PathBuf>,
+
+    /// Load env vars from a directory of secret files (one file per var)
+    #[arg(long = "env-dir")]
+    env_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -40,6 +48,17 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let cli = Cli::parse();
+
+    if let Some(ref env_path) = cli.env_file {
+        llmrouter::config::Config::load_env_file(env_path)?;
+        info!(path = %env_path.display(), "loaded env file");
+    }
+
+    if let Some(ref env_dir) = cli.env_dir {
+        llmrouter::config::Config::load_env_dir(env_dir)?;
+        info!(path = %env_dir.display(), "loaded env dir");
+    }
+
     let config = llmrouter::config::Config::load(&cli.config)?;
 
     info!(listen = %config.listen, "starting llmrouter");
