@@ -101,6 +101,9 @@ impl ProviderConfig {
 
     pub fn resolved_kind(&self) -> ProviderKind {
         if self.vertex_ai.is_some() {
+            if self.api_key.is_some() {
+                return ProviderKind::ApiKey;
+            }
             return ProviderKind::GcpMetadata;
         }
         if let Some(ref az) = self.azure_openai {
@@ -262,6 +265,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(provider.resolved_kind(), ProviderKind::GcpMetadata);
+    }
+
+    #[test]
+    fn vertex_ai_with_api_key_uses_api_key_auth() {
+        let provider = ProviderConfig {
+            api_key: Some("my-key".into()),
+            vertex_ai: Some(VertexAiConfig {
+                project_id: "p".into(),
+                location: "l".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(provider.resolved_kind(), ProviderKind::ApiKey);
+        // base_url should still be derived from vertex_ai config
+        let url = provider.resolved_base_url().unwrap();
+        assert!(url.contains("aiplatform.googleapis.com"));
     }
 
     #[test]
