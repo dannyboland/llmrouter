@@ -1,8 +1,12 @@
 # llmrouter
 
-A lightweight LLM load-balancing sidecar written in Rust. Runs alongside each application instance, exposes an OpenAI-compatible API on localhost, and routes to the lowest-latency upstream provider.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/dannyboland/llmrouter)](https://github.com/dannyboland/llmrouter/releases)
+[![Docker Image](https://img.shields.io/badge/docker-ghcr.io%2Fdannyboland%2Fllmrouter-blue?logo=docker)](https://ghcr.io/dannyboland/llmrouter)
 
-LLM providers have variable latency and availability that can break production features. llmrouter sits beside your app and automatically shifts traffic to whichever provider is fastest right now.
+**Automatic latency-based routing across LLM providers. ~1 ms overhead. Zero infrastructure.**
+
+LLM providers have variable latency and availability that can break production features. llmrouter is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest right now.
 
 ## Features
 
@@ -16,12 +20,29 @@ LLM providers have variable latency and availability that can break production f
 
 ## Quick start
 
+**Docker** — best for production deployments and Kubernetes sidecars:
+
 ```bash
-cargo build --release
-./target/release/llmrouter --config config.toml
+docker run -v ./config.toml:/config.toml \
+  -p 4000:4000 \
+  ghcr.io/dannyboland/llmrouter:latest
 ```
 
-Point your OpenAI SDK at `http://127.0.0.1:4000` and use model aliases instead of real model names:
+**Pre-built binary** — best for CI, scripting, or running without Docker:
+
+```bash
+# Linux (x86_64) — also available for aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
+curl -fsSL https://github.com/dannyboland/llmrouter/releases/latest/download/llmrouter-x86_64-unknown-linux-musl -o llmrouter
+chmod +x llmrouter
+./llmrouter --config config.toml
+```
+
+Then point any OpenAI-compatible SDK at llmrouter — the only change is the base URL:
+
+```diff
+- client = OpenAI(base_url="https://api.openai.com/v1", api_key="sk-...")
++ client = OpenAI(base_url="http://127.0.0.1:4000/v1", api_key="unused")
+```
 
 ```python
 from openai import OpenAI
@@ -137,11 +158,9 @@ Fully stateless — works across pods with no shared state. If the pinned provid
 
 ## Docker
 
-```bash
-docker run -v ./config.toml:/config.toml \
-  -p 4000:4000 \
-  ghcr.io/dannyboland/llmrouter:latest
-```
+When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
+
+The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/dannyboland/llmrouter`. Tags follow semver: `:latest`, `:3.0`, `:3.0.0`.
 
 To inject secrets via a mounted `.env` file:
 
@@ -153,7 +172,9 @@ docker run -v ./config.toml:/config.toml \
   ghcr.io/dannyboland/llmrouter:latest --env-file /secrets/.env
 ```
 
-When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
+## Performance
+
+**~1.3 ms of end-to-end overhead** measured with the [Ferro Labs AI gateway benchmark](https://github.com/ferro-labs/ai-gateway-performance-benchmarks) methodology.
 
 ## Building
 
