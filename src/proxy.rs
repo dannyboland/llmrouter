@@ -199,20 +199,30 @@ where
     })
 }
 
-// Copy upstream headers to the client, dropping Set-Cookie: the upstream's
-// cookies (e.g. Cloudflare's `__cf*` in front of OpenAI) are scoped to its
-// origin, not the proxy's, so clients reject them and warn.
+// Hop-by-hop (RFC 9110 §7.6.1) plus origin-scoped headers; everything else relays through.
+const STRIP_HEADERS: &[reqwest::header::HeaderName] = &[
+    reqwest::header::CONNECTION,
+    reqwest::header::TRANSFER_ENCODING,
+    reqwest::header::TE,
+    reqwest::header::TRAILER,
+    reqwest::header::UPGRADE,
+    reqwest::header::PROXY_AUTHENTICATE,
+    reqwest::header::PROXY_AUTHORIZATION,
+    reqwest::header::SET_COOKIE,
+    reqwest::header::ALT_SVC,
+];
+
 fn sanitize_response_headers(upstream: &reqwest::header::HeaderMap) -> hyper::HeaderMap {
     let mut headers = hyper::HeaderMap::new();
     for (k, v) in upstream {
-        if k == reqwest::header::SET_COOKIE {
+        if STRIP_HEADERS.contains(k) || k.as_str().eq_ignore_ascii_case("keep-alive") {
             continue;
         }
         if let (Ok(name), Ok(val)) = (
             hyper::header::HeaderName::from_bytes(k.as_str().as_bytes()),
             hyper::header::HeaderValue::from_bytes(v.as_bytes()),
         ) {
-            headers.insert(name, val);
+            headers.append(name, val);
         }
     }
     headers
@@ -371,28 +381,34 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_headers_strips_set_cookie_and_keeps_others() {
+    fn sanitize_headers_strips_unsafe_and_preserves_rest() {
         let mut upstream = reqwest::header::HeaderMap::new();
         upstream.insert("content-type", "application/json".parse().unwrap());
-        upstream.append(
-            reqwest::header::SET_COOKIE,
-            "__cf_bm=abc; path=/; secure".parse().unwrap(),
+        upstream.insert(
+            reqwest::header::TRANSFER_ENCODING,
+            "chunked".parse().unwrap(),
         );
-        upstream.append(
-            reqwest::header::SET_COOKIE,
-            "__cfduid=def; path=/".parse().unwrap(),
-        );
+        upstream.insert(reqwest::header::CONNECTION, "keep-alive".parse().unwrap());
+        upstream.insert(reqwest::header::ALT_SVC, "h3=\":443\"".parse().unwrap());
+        upstream.append(reqwest::header::SET_COOKIE, "__cf_bm=abc".parse().unwrap());
+        upstream.append(reqwest::header::SET_COOKIE, "__cfduid=def".parse().unwrap());
+        upstream.append(reqwest::header::VARY, "accept".parse().unwrap());
+        upstream.append(reqwest::header::VARY, "origin".parse().unwrap());
 
         let sanitized = sanitize_response_headers(&upstream);
 
-        assert!(
-            !sanitized.contains_key(reqwest::header::SET_COOKIE),
-            "set-cookie should be stripped"
-        );
-        assert_eq!(
-            sanitized.get("content-type").unwrap(),
-            "application/json",
-            "non-cookie headers should be preserved"
-        );
+        for stripped in [
+            reqwest::header::SET_COOKIE,
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::CONNECTION,
+            reqwest::header::ALT_SVC,
+        ] {
+            assert!(
+                !sanitized.contains_key(&stripped),
+                "{stripped} should be stripped"
+            );
+        }
+        assert_eq!(sanitized.get("content-type").unwrap(), "application/json");
+        assert_eq!(sanitized.get_all(reqwest::header::VARY).iter().count(), 2);
     }
 }
