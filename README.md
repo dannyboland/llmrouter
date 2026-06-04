@@ -4,7 +4,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/dannyboland/llmrouter)](https://github.com/dannyboland/llmrouter/releases)
 [![Docker Image](https://img.shields.io/badge/docker-ghcr.io%2Fdannyboland%2Fllmrouter-blue?logo=docker)](https://ghcr.io/dannyboland/llmrouter)
 
-**Automatic latency-based routing across LLM providers. ~1.3 ms overhead. Zero infrastructure.**
+**Automatic latency-based routing across LLM providers. A single static binary, zero infrastructure.**
 
 LLM providers have variable latency and availability that can break production features. llmrouter is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest and available right now.
 
@@ -269,7 +269,7 @@ docker run -v ./config.toml:/config.toml \
 
 ## Performance
 
-**~1.3 ms of end-to-end overhead** measured with the [Ferro Labs AI gateway benchmark](https://github.com/ferro-labs/ai-gateway-performance-benchmarks) methodology.
+llmrouter's own overhead is negligible next to the hundreds of milliseconds, or even many seconds, of provider latency it routes around. It's a thin Rust proxy in the hot path, not a platform. If you want to measure it yourself, the [Ferro Labs AI gateway benchmark](https://github.com/ferro-labs/ai-gateway-performance-benchmarks) is a reasonable methodology.
 
 ## Building
 
