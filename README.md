@@ -8,33 +8,6 @@
 
 LLM providers have variable latency and availability that can break production features. llmrouter is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest and available right now.
 
-## Features
-
-- **Latency-based routing** — tracks EWMA of time-to-first-chunk per (provider, model) and routes to the fastest candidate
-- **Explore/exploit** — configurable fraction of traffic round-robins across all healthy candidates, discovering cold providers and re-sampling warm ones to detect latency changes
-- **Error rate tracking** — time-based sliding window deprioritizes failing candidates; degraded candidates are excluded from traffic until errors age out
-- **Session affinity** — stateless `x-session-affinity` header pins subsequent requests to the same provider, works across pods with no shared state, with automatic fallback on degradation
-- **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive with no buffering
-- **Vertex AI support** — GKE Workload Identity auth via metadata server with automatic token refresh
-- **Zero infrastructure** — single static binary, no Redis/database/control plane
-
-## Why llmrouter
-
-Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. llmrouter is deliberately the opposite:
-
-- **A single static binary, not a platform.** A Rust codebase you can read in an afternoon. No database, no Redis, no control plane, no background services — it runs as a standalone sidecar next to your app.
-- **Small, auditable surface area.** It does one thing — latency-aware routing across providers you configure — with a tight dependency list and a smaller attack surface.
-- **Free and self-hosted.** MIT-licensed and runs entirely inside your infrastructure.
-- **Transparent proxy.** It speaks the OpenAI API and forwards requests largely untouched (model alias resolved, auth set). Point any OpenAI-compatible SDK at it by changing one base URL.
-
-If you need a full LLMOps platform — spend tracking, prompt management, a UI, dozens of integrations — llmrouter is intentionally not that. It's the lean routing layer you drop in when you want fast, resilient multi-provider routing.
-
-### Design choices
-
-llmrouter has a bounded scope by design and has some deliberate omissions:
-
-- **No request-level failover or retries.** llmrouter is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. Error responses still feed the routing signal, so a flaky provider is quickly deprioritized for subsequent traffic — but the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let llmrouter steer those retries toward the healthiest provider.
-- **Latency-based, not cost or quality-based.** Routing optimizes time-to-first-chunk *within an alias*, and every model routed under that alias should be largely interchangeable. llmrouter never trades quality or cost for speed — it just picks the fastest among options you've already deemed equivalent.
 
 ## Quick start
 
@@ -70,6 +43,28 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
+
+## Features
+
+- **Latency-based routing** — routes to the candidate with the lowest EWMA time-to-first-chunk per (provider, model).
+- **Explore/exploit** — a configurable fraction of traffic round-robins across all healthy candidates to discover cold providers and detect latency changes.
+- **Error rate tracking** — a time-based sliding window excludes failing candidates until their errors age out.
+- **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods, with automatic fallback on degradation.
+- **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive, with no buffering.
+- **Vertex AI support** — GKE Workload Identity auth via the metadata server, with automatic token refresh.
+- **Zero infrastructure** — a single static binary; no Redis, database, or control plane.
+
+## Contents
+
+- [Configuration](#configuration)
+- [Endpoints](#endpoints)
+- [Observability](#observability)
+- [Session affinity](#session-affinity)
+- [How routing works](#how-routing-works)
+- [Why llmrouter](#why-llmrouter)
+- [Docker](#docker)
+- [Performance](#performance)
+- [Building](#building)
 
 ## Configuration
 
@@ -123,18 +118,14 @@ error_threshold = 0.5      # error rate above which a candidate is excluded
 error_decay_secs = 300     # time window for error rate calculation; old errors age out naturally
 ```
 
-Environment variables in `${VAR}` syntax are interpolated at config load time.
-
-### Loading secrets
-
-Where environment variables are available in an .env file, this can be passed with `--env-file`:
+Environment variables in `${VAR}` syntax are interpolated at config load time. Where they're available in an `.env` file (`KEY=VALUE` per line), pass it with `--env-file`:
 
 ```bash
-# Single .env file (KEY=VALUE per line)
 llmrouter --env-file /secrets/.env
 ```
 
-### Vertex billing attribution
+<details>
+<summary><b>Vertex billing attribution</b></summary>
 
 For Vertex providers, llmrouter can inject sidecar-controlled `labels` into outbound requests so the resulting spend shows up tagged in GCP Billing Export. The labels live in a top-level `[attribution]` block (typically deployment identity sourced from env vars) and are merged into each request body for any Vertex provider that opts in:
 
@@ -149,6 +140,8 @@ vertex_ai = { project_id = "my-project", location = "us-central1", attribution =
 ```
 
 Sidecar keys take precedence over any client-supplied `labels` keys with the same name; disjoint client keys are preserved. The feature is currently scoped to Vertex only. Keys and values must conform to Vertex naming rules (`[a-z][a-z0-9_-]{0,62}`).
+
+</details>
 
 ## Endpoints
 
@@ -217,6 +210,22 @@ Fully stateless — works across pods with no shared state. If the pinned provid
 
 > **Tuning `explore_ratio` for production.** The default `0.2` favors visibility and fresh estimates at low/dev volume. Exploration trades a little latency for keeping EWMAs current and detecting when a provider recovers, and the right value scales inversely with traffic: at production volume `0.02`–`0.05` is usually plenty, since even a small fraction of high request rates yields many samples per provider.
 
+## Why llmrouter
+
+Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. llmrouter is deliberately the opposite — **a single static binary, not a platform**: a Rust codebase you can read in an afternoon, with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API and forwards requests largely untouched, so any OpenAI-compatible SDK works by changing one base URL.
+
+If you need a full LLMOps platform — spend tracking, prompt management, a UI, dozens of integrations — llmrouter is intentionally not that.
+
+<details>
+<summary><b>Design choices &amp; deliberate omissions</b></summary>
+
+llmrouter has a bounded scope by design and has some deliberate omissions:
+
+- **No request-level failover or retries.** llmrouter is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. Error responses still feed the routing signal, so a flaky provider is quickly deprioritized for subsequent traffic — but the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let llmrouter steer those retries toward the healthiest provider.
+- **Latency-based, not cost or quality-based.** Routing optimizes time-to-first-chunk *within an alias*, and every model routed under that alias should be largely interchangeable. llmrouter never trades quality or cost for speed — it just picks the fastest among options you've already deemed equivalent.
+
+</details>
+
 ## Docker
 
 When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
@@ -226,14 +235,16 @@ The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.
 To inject secrets via a mounted `.env` file:
 
 ```bash
-# .env file
 docker run -v ./config.toml:/config.toml \
   -v ./secrets.env:/secrets/.env:ro \
   -p 4000:4000 \
   ghcr.io/dannyboland/llmrouter:latest --env-file /secrets/.env
 ```
 
-For Vertex outside GKE (on GKE, workload identity is picked up automatically), supply credentials one of two ways.
+<details>
+<summary><b>Vertex credentials outside GKE</b></summary>
+
+On GKE, workload identity is picked up automatically. Elsewhere, supply credentials one of two ways.
 
 A service account key, pointed to by `GOOGLE_APPLICATION_CREDENTIALS` (recommended for production):
 
@@ -253,6 +264,8 @@ docker run -v ./config.toml:/config.toml \
   -p 4000:4000 \
   ghcr.io/dannyboland/llmrouter:latest
 ```
+
+</details>
 
 ## Performance
 
