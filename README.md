@@ -215,6 +215,8 @@ Fully stateless — works across pods with no shared state. If the pinned provid
 6. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded
 7. TTFC is measured at first chunk arrival and fed back into the EWMA
 
+> **Tuning `explore_ratio` for production.** The default `0.2` favors visibility and fresh estimates at low/dev volume. Exploration trades a little latency for keeping EWMAs current and detecting when a provider recovers, and the right value scales inversely with traffic: at production volume `0.02`–`0.05` is usually plenty, since even a small fraction of high request rates yields many samples per provider.
+
 ## Docker
 
 When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.

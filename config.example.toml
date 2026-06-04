@@ -60,7 +60,7 @@ code = [
 
 [routing]
 ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
-explore_ratio = 0.2        # fraction of traffic sent to cold candidates for latency exploration
+explore_ratio = 0.2        # fraction that round-robins across all healthy candidates; lower to ~0.02-0.05 at production volume
 error_threshold = 0.5      # error rate above which a candidate is deprioritized
 error_decay_secs = 300     # time window for error rate calculation; old errors age out naturally
 connect_timeout_secs = 10  # max seconds to establish upstream connection
