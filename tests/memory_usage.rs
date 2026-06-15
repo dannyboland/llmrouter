@@ -23,6 +23,8 @@ use llmrouter::tracker::Tracker;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+mod common;
+
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -46,72 +48,14 @@ async fn run_mock_upstream(listener: TcpListener, uploaded_tx: tokio::sync::mpsc
         };
         let uploaded_tx = uploaded_tx.clone();
         tokio::spawn(async move {
-            // 64 KB scratch reused for the whole request: nothing accumulates.
-            let mut buf = vec![0u8; 64 * 1024];
-            let mut header = Vec::new();
-            let mut header_done = false;
-            let mut body_remaining: Option<usize> = None;
-            // Rolling tail to spot the chunked terminator across reads.
-            let mut tail = [0u8; 8];
-            loop {
-                let Ok(n) = socket.read(&mut buf).await else {
-                    return;
-                };
-                if n == 0 {
-                    return;
-                }
-                let mut chunk = &buf[..n];
-                if !header_done {
-                    header.extend_from_slice(chunk);
-                    let Some(end) = header.windows(4).position(|w| w == b"\r\n\r\n") else {
-                        continue;
-                    };
-                    header_done = true;
-                    let head = String::from_utf8_lossy(&header[..end]).to_lowercase();
-                    body_remaining = head
-                        .lines()
-                        .find_map(|l| l.strip_prefix("content-length:"))
-                        .and_then(|v| v.trim().parse::<usize>().ok());
-                    let body_start = end + 4 - (header.len() - n);
-                    chunk = &buf[body_start..n];
-                    header.clear();
-                    header.shrink_to_fit();
-                }
-                match body_remaining {
-                    Some(ref mut remaining) => {
-                        *remaining = remaining.saturating_sub(chunk.len());
-                        if *remaining > 0 {
-                            continue;
-                        }
-                    }
-                    None => {
-                        // Chunked: done at the 0-length terminator.
-                        let mut window = tail.to_vec();
-                        window.extend_from_slice(chunk);
-                        let len = chunk.len().min(tail.len());
-                        let mut new_tail = [0u8; 8];
-                        new_tail[8 - len..].copy_from_slice(&chunk[chunk.len() - len..]);
-                        if len < 8 {
-                            new_tail[..8 - len].copy_from_slice(&tail[len..]);
-                        }
-                        tail = new_tail;
-                        if !window.windows(5).any(|w| w == b"0\r\n\r\n") {
-                            continue;
-                        }
-                    }
-                }
-                break;
+            // Drains the upload (Content-Length or chunked) with bounded memory,
+            // so live heap during the stall is attributable to the router.
+            if common::read_request(&mut socket).await.is_err() {
+                return;
             }
-
             let _ = uploaded_tx.send(()).await;
             tokio::time::sleep(UPSTREAM_HOLD).await;
-            let body = r#"{"id":"mock","choices":[]}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = socket.write_all(resp.as_bytes()).await;
+            common::write_ok_close(&mut socket, r#"{"id":"mock","choices":[]}"#).await;
         });
     }
 }
