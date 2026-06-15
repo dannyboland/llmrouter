@@ -212,15 +212,29 @@ impl RoutingConfig {
 
 /// The container's memory limit from cgroups (v2, then v1), if one is set.
 fn cgroup_memory_limit() -> Option<u64> {
-    if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-        // v2: a byte count, or "max" when unlimited.
-        return raw.trim().parse().ok();
+    cgroup_memory_limit_from(
+        Path::new("/sys/fs/cgroup/memory.max"),
+        Path::new("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    )
+}
+
+/// Prefer cgroup v2, fall back to v1, else `None` (unlimited or unavailable).
+fn cgroup_memory_limit_from(v2: &Path, v1: &Path) -> Option<u64> {
+    if let Ok(raw) = std::fs::read_to_string(v2) {
+        return parse_cgroup_v2(&raw);
     }
-    let raw = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?;
-    let limit: u64 = raw.trim().parse().ok()?;
-    // v1 reports a page-rounded i64::MAX when unlimited.
+    parse_cgroup_v1(&std::fs::read_to_string(v1).ok()?)
+}
+
+/// v2: a byte count, or "max" (unparseable → `None`) when unlimited.
+fn parse_cgroup_v2(raw: &str) -> Option<u64> {
+    raw.trim().parse().ok()
+}
+
+/// v1: a byte count; reports a page-rounded `i64::MAX` when unlimited.
+fn parse_cgroup_v1(raw: &str) -> Option<u64> {
     const UNBOUNDED_THRESHOLD: u64 = 1u64 << 60;
-    // Use cgroup limit if bounded, otherwise None and fallback should be used
+    let limit: u64 = raw.trim().parse().ok()?;
     (limit < UNBOUNDED_THRESHOLD).then_some(limit)
 }
 
@@ -663,6 +677,27 @@ test = [{ provider = "bad", model = "test" }]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn cgroup_parsing_handles_limits_and_unlimited_sentinels() {
+        assert_eq!(parse_cgroup_v2("268435456\n"), Some(268435456));
+        assert_eq!(parse_cgroup_v2("max\n"), None); // v2 unlimited
+        assert_eq!(parse_cgroup_v1("268435456\n"), Some(268435456));
+        assert_eq!(parse_cgroup_v1("9223372036854771712"), None); // v1 page-rounded i64::MAX
+    }
+
+    #[test]
+    fn cgroup_prefers_v2_over_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = dir.path().join("memory.max");
+        let v1 = dir.path().join("limit_in_bytes");
+        std::fs::write(&v2, "111\n").unwrap();
+        std::fs::write(&v1, "999\n").unwrap();
+        assert_eq!(cgroup_memory_limit_from(&v2, &v1), Some(111));
+        // v2 absent → fall back to v1.
+        std::fs::remove_file(&v2).unwrap();
+        assert_eq!(cgroup_memory_limit_from(&v2, &v1), Some(999));
     }
 
     mod env_dir {
