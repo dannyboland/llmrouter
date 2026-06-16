@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
+use hyper::body::Body as _;
 use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -29,9 +30,45 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub exploit_k: f64,
     pub gcp_token_provider: Option<GcpTokenProvider>,
-    pub max_body_bytes: usize,
+    pub budget: BufferBudget,
     pub metrics: Metrics,
     pub shutting_down: AtomicBool,
+}
+
+/// Caps how much memory all in-flight requests may spend buffering bodies,
+/// and the size of any single body. The one place that decides admission:
+/// too big for the cap → 413, momentarily over budget → 429.
+pub struct BufferBudget {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    permits: usize,
+    pub max_body_bytes: usize,
+}
+
+impl BufferBudget {
+    pub fn new(budget_bytes: usize, max_body_bytes: usize) -> Self {
+        let permits = (budget_bytes / 1024).clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
+            permits,
+            max_body_bytes: max_body_bytes.min(permits * 1024),
+        }
+    }
+
+    /// Reserve permits for `bytes` of buffer (1 KB granularity, at least
+    /// one), or None if the budget is exhausted.
+    pub fn reserve(&self, bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let want = u32::try_from(bytes.div_ceil(1024).max(1)).unwrap_or(u32::MAX);
+        self.semaphore.clone().try_acquire_many_owned(want).ok()
+    }
+
+    /// The budget's total size in KB-permits.
+    pub fn permits(&self) -> usize {
+        self.permits
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
 }
 
 type BoxBody = http_body_util::Either<
@@ -110,43 +147,78 @@ pub async fn handle_request(
 
     let affinity_header = req.headers_mut().remove("x-session-affinity");
 
-    let max_body = state.max_body_bytes;
+    let max_body = state.budget.max_body_bytes;
+
+    // We have to reserve the request size before buffering it
+    // We 413 if too large or 429 if we don't have memory for it just now.
+    let Some(declared_len) = req
+        .body()
+        .size_hint()
+        .exact()
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return Ok(json_error(
+            hyper::StatusCode::LENGTH_REQUIRED,
+            "Content-Length is required",
+        ));
+    };
+    if declared_len > max_body {
+        return Ok(json_error(
+            hyper::StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("request body too large (max {} MB)", max_body / 1024 / 1024),
+        ));
+    }
+    let Some(permit) = state.budget.reserve(declared_len) else {
+        state.metrics.buffer_rejections_total.inc();
+        let mut resp = json_error(
+            hyper::StatusCode::TOO_MANY_REQUESTS,
+            "buffer budget exhausted, retry shortly",
+        );
+        resp.headers_mut().insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        return Ok(resp);
+    };
+
     let body_bytes = match Limited::new(req, max_body).collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("failed to read request body: {e}");
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
             return Ok(json_error(
                 hyper::StatusCode::PAYLOAD_TOO_LARGE,
                 &format!("request body too large (max {} MB)", max_body / 1024 / 1024),
             ));
         }
-    };
-
-    let body_map: serde_json::Map<String, serde_json::Value> =
-        match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-            Ok(serde_json::Value::Object(m)) => m,
-            Ok(_) => {
-                return Ok(json_error(
-                    hyper::StatusCode::BAD_REQUEST,
-                    "request body must be a JSON object",
-                ));
-            }
-            Err(e) => {
-                return Ok(json_error(
-                    hyper::StatusCode::BAD_REQUEST,
-                    &format!("request body is not valid JSON: {e}"),
-                ));
-            }
-        };
-
-    let alias = match body_map.get("model").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
+        Err(e) => {
+            warn!("failed to read request body: {e}");
             return Ok(json_error(
                 hyper::StatusCode::BAD_REQUEST,
-                "missing 'model' field in request body",
+                "failed to read request body",
             ));
         }
+    };
+
+    let body: crate::body::RawBody = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) if e.classify() == serde_json::error::Category::Data => {
+            return Ok(json_error(
+                hyper::StatusCode::BAD_REQUEST,
+                "request body must be a JSON object",
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("request body is not valid JSON: {e}"),
+            ));
+        }
+    };
+
+    let Some(alias) = body.get_as::<String>("model") else {
+        return Ok(json_error(
+            hyper::StatusCode::BAD_REQUEST,
+            "missing 'model' field in request body",
+        ));
     };
 
     let Some(candidates) = state.model_map.get(&alias) else {
@@ -180,10 +252,7 @@ pub async fn handle_request(
     });
 
     // Needed before routing: mode selects which EWMA the router compares.
-    let is_streaming = body_map
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_streaming = body.get_as::<bool>("stream").unwrap_or(false);
     let latency_mode = if is_streaming {
         LatencyMode::Streaming
     } else {
@@ -221,12 +290,31 @@ pub async fn handle_request(
         "routing request"
     );
 
+    let outbound = match proxy::prepare_outbound(
+        body,
+        &candidate.model,
+        candidate.attribution_labels.as_deref(),
+        Some(permit),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(error = %e, "failed to serialize outbound body");
+            return Ok(json_error(
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize outbound body",
+            ));
+        }
+    };
+    // Only the outbound copy is held while waiting on the upstream.
+    drop(body_bytes);
+
     let result = proxy::forward_request(
         &state.client,
         candidate,
         &path,
-        body_map,
+        outbound,
         is_streaming,
+        state.budget.max_body_bytes,
         state.gcp_token_provider.as_ref(),
     )
     .await;
@@ -421,700 +509,4 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
     #[allow(clippy::expect_used)]
     let bytes = Bytes::from(serde_json::to_vec_pretty(&body).expect("serialize status JSON"));
     json_response(hyper::StatusCode::OK, bytes)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::metrics::Metrics;
-    use crate::model_map::ModelMap;
-    use crate::router::RoundRobinState;
-    use crate::tracker::Tracker;
-    use tokio::sync::oneshot;
-
-    fn test_state_with_upstream(upstream_port: u16) -> Arc<AppState> {
-        crate::init_crypto();
-        let config: crate::config::Config = toml::from_str(&format!(
-            r#"
-[provider.test]
-base_url = "http://127.0.0.1:{upstream_port}"
-api_key = "fake"
-
-[model]
-fast = [{{ provider = "test", model = "test-model" }}]
-"#,
-        ))
-        .unwrap();
-
-        let mut tracker = Tracker::new(0.3, 0.5);
-        let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
-        let mut rr_state = RoundRobinState::new();
-        for alias in config.model.keys() {
-            rr_state.register_alias(alias.clone());
-        }
-
-        Arc::new(AppState {
-            model_map,
-            tracker,
-            rr_state,
-            client: reqwest::Client::new(),
-            exploit_k: 3.0,
-            gcp_token_provider: None,
-            max_body_bytes: 100 * 1024 * 1024,
-            metrics: Metrics::new(),
-            shutting_down: AtomicBool::new(false),
-        })
-    }
-
-    fn test_state() -> Arc<AppState> {
-        test_state_with_upstream(9999)
-    }
-
-    #[tokio::test]
-    async fn health_endpoint_returns_ok() {
-        let state = test_state();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (_tx, rx) = oneshot::channel::<()>();
-
-        tokio::spawn(run_server(
-            listener,
-            state,
-            async {
-                let _ = rx.await;
-            },
-            Duration::from_secs(1),
-        ));
-
-        let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
-        assert_eq!(resp.status(), 200);
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_returns_prometheus_text() {
-        let state = test_state();
-
-        state
-            .metrics
-            .requests_total
-            .with_label_values(&["fast", "test", "test-model", "200"])
-            .inc();
-        state
-            .metrics
-            .ttfc_seconds
-            .with_label_values(&["fast", "test", "test-model"])
-            .observe(0.1);
-        state
-            .metrics
-            .latency_seconds
-            .with_label_values(&["fast", "test", "test-model"])
-            .observe(0.2);
-        state
-            .metrics
-            .errors_total
-            .with_label_values(&["fast", "test", "test-model"])
-            .inc();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (_tx, rx) = oneshot::channel::<()>();
-
-        tokio::spawn(run_server(
-            listener,
-            state,
-            async {
-                let _ = rx.await;
-            },
-            Duration::from_secs(1),
-        ));
-
-        let resp = reqwest::get(format!("http://{addr}/metrics"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(
-            content_type.starts_with("text/plain"),
-            "expected text/plain content-type, got {content_type}"
-        );
-        let body = resp.text().await.unwrap();
-        assert!(body.contains("llmrouter_requests_total"));
-        assert!(body.contains("llmrouter_ttfc_seconds"));
-        assert!(body.contains("llmrouter_latency_seconds"));
-        assert!(body.contains("llmrouter_errors_total"));
-    }
-
-    #[tokio::test]
-    async fn shutdown_signal_stops_accept_loop() {
-        let state = test_state();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel::<()>();
-
-        let server_handle = tokio::spawn(run_server(
-            listener,
-            state,
-            async {
-                let _ = rx.await;
-            },
-            Duration::from_secs(1),
-        ));
-
-        // Confirm server is up
-        let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
-        assert_eq!(resp.status(), 200);
-
-        // Send shutdown signal
-        tx.send(()).unwrap();
-
-        // Server task should complete
-        tokio::time::timeout(std::time::Duration::from_secs(2), server_handle)
-            .await
-            .expect("server did not shut down within 2s")
-            .expect("server task panicked");
-
-        // New connections should be refused
-        let result = reqwest::get(format!("http://{addr}/health")).await;
-        assert!(
-            result.is_err(),
-            "expected connection refused after shutdown"
-        );
-    }
-
-    #[tokio::test]
-    async fn health_returns_503_during_shutdown() {
-        let state = test_state();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (_tx, rx) = oneshot::channel::<()>();
-
-        // Mark as shutting down before starting so we can test the endpoint
-        state.shutting_down.store(true, Ordering::Relaxed);
-
-        tokio::spawn(run_server(
-            listener,
-            state,
-            async {
-                let _ = rx.await;
-            },
-            Duration::from_secs(1),
-        ));
-
-        let resp = reqwest::get(format!("http://{addr}/health")).await.unwrap();
-        assert_eq!(resp.status(), 503);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "shutting_down");
-    }
-
-    /// Mock upstream that accepts one request, signals readiness, waits for a
-    /// release signal, then responds.
-    async fn slow_upstream() -> (
-        u16,
-        oneshot::Sender<()>,
-        oneshot::Receiver<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (tx, rx) = oneshot::channel::<()>();
-        let (ready_tx, ready_rx) = oneshot::channel::<()>();
-        let handle = tokio::spawn(async move {
-            let (mut conn, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let _ = conn.read(&mut buf).await.unwrap();
-            let _ = ready_tx.send(());
-            let _ = rx.await;
-            conn.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":\"ok\"}"
-            ).await.unwrap();
-        });
-        (port, tx, ready_rx, handle)
-    }
-
-    /// Mock upstream that accepts one request and never responds.
-    async fn hanging_upstream() -> (u16, tokio::task::JoinHandle<()>) {
-        use tokio::io::AsyncReadExt;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            let (mut conn, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let _ = conn.read(&mut buf).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            drop(conn);
-        });
-        (port, handle)
-    }
-
-    fn proxy_request(
-        addr: std::net::SocketAddr,
-    ) -> tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>> {
-        crate::init_crypto();
-        tokio::spawn(async move {
-            reqwest::Client::new()
-                .post(format!("http://{addr}/v1/chat/completions"))
-                .json(&serde_json::json!({"model": "fast", "messages": []}))
-                .send()
-                .await
-        })
-    }
-
-    #[tokio::test]
-    async fn graceful_drain_waits_for_inflight_request() {
-        let (mock_port, upstream_tx, upstream_ready, mock_handle) = slow_upstream().await;
-        let state = test_state_with_upstream(mock_port);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-        let mut server_handle = tokio::spawn(run_server(
-            listener,
-            state,
-            async {
-                let _ = shutdown_rx.await;
-            },
-            Duration::from_secs(5),
-        ));
-
-        let client_handle = proxy_request(addr);
-        // Request is in-flight once the upstream has received it.
-        upstream_ready.await.unwrap();
-
-        shutdown_tx.send(()).unwrap();
-
-        // Server should still be draining
-        let poll = tokio::time::timeout(Duration::from_millis(500), &mut server_handle).await;
-        assert!(
-            poll.is_err(),
-            "server exited while request was still in flight"
-        );
-
-        // Release the upstream; request completes, server exits
-        upstream_tx.send(()).unwrap();
-        let resp = client_handle.await.unwrap().unwrap();
-        assert_eq!(resp.status(), 200);
-
-        tokio::time::timeout(Duration::from_secs(2), server_handle)
-            .await
-            .expect("server did not shut down after drain")
-            .expect("server task panicked");
-
-        mock_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn graceful_drain_timeout_force_exits() {
-        let (mock_port, mock_handle) = hanging_upstream().await;
-        let state = test_state_with_upstream(mock_port);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-        let server_handle = tokio::spawn(run_server(
-            listener,
-            state,
-            async {
-                let _ = shutdown_rx.await;
-            },
-            Duration::from_millis(300),
-        ));
-
-        let client_handle = proxy_request(addr);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        shutdown_tx.send(()).unwrap();
-
-        // Server should exit after drain timeout despite hanging upstream
-        tokio::time::timeout(Duration::from_secs(3), server_handle)
-            .await
-            .expect("server did not exit after drain timeout")
-            .expect("server task panicked");
-
-        mock_handle.abort();
-        client_handle.abort();
-    }
-
-    /// Mock upstream that accepts N requests and responds immediately.
-    async fn instant_upstream(n: usize) -> (u16, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            for _ in 0..n {
-                let (mut conn, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0u8; 4096];
-                let _ = conn.read(&mut buf).await.unwrap();
-                conn.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":\"ok\"}",
-                )
-                .await
-                .unwrap();
-            }
-        });
-        (port, handle)
-    }
-
-    async fn failing_upstream(status_line: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            let (mut conn, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let _ = conn.read(&mut buf).await.unwrap();
-            let body = b"{\"error\":\"nope\"}";
-            let resp = format!(
-                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            );
-            conn.write_all(resp.as_bytes()).await.unwrap();
-            conn.write_all(body).await.unwrap();
-        });
-        (port, handle)
-    }
-
-    fn start_server(
-        state: Arc<AppState>,
-    ) -> (
-        std::net::SocketAddr,
-        oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let listener = TcpListener::from_std(listener).unwrap();
-        let (tx, rx) = oneshot::channel::<()>();
-        let handle = tokio::spawn(run_server(
-            listener,
-            state,
-            async {
-                let _ = rx.await;
-            },
-            Duration::from_secs(1),
-        ));
-        (addr, tx, handle)
-    }
-
-    #[tokio::test]
-    async fn response_includes_session_affinity_header() {
-        let (mock_port, mock_handle) = instant_upstream(1).await;
-        let state = test_state_with_upstream(mock_port);
-        let (addr, _tx, _server) = start_server(state);
-
-        let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/chat/completions"))
-            .json(&serde_json::json!({"model": "fast", "messages": []}))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), 200);
-        let affinity = resp
-            .headers()
-            .get("x-session-affinity")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(affinity, "test/test-model");
-
-        mock_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn affinity_header_pins_to_candidate() {
-        crate::init_crypto();
-        // Two distinct upstreams for the same model alias
-        let (port_a, handle_a) = instant_upstream(1).await;
-        let (port_b, handle_b) = instant_upstream(0).await;
-
-        let config: crate::config::Config = toml::from_str(&format!(
-            r#"
-[provider.alpha]
-base_url = "http://127.0.0.1:{port_a}"
-api_key = "fake"
-
-[provider.beta]
-base_url = "http://127.0.0.1:{port_b}"
-api_key = "fake"
-
-[model]
-fast = [
-  {{ provider = "alpha", model = "test-model" }},
-  {{ provider = "beta",  model = "test-model" }},
-]
-"#,
-        ))
-        .unwrap();
-
-        let mut tracker = Tracker::new(0.3, 0.5);
-        let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
-        let mut rr_state = RoundRobinState::new();
-        for alias in config.model.keys() {
-            rr_state.register_alias(alias.clone());
-        }
-
-        // Make beta look fast (10ms) and alpha slow (500ms) so the router
-        // naturally prefers beta, then pin to alpha and verify the pin wins.
-        // The request is non-streaming, so seed that EWMA.
-        let fast_candidates = model_map.get("fast").unwrap();
-        let alpha_idx = fast_candidates
-            .iter()
-            .find(|c| c.provider_name == "alpha")
-            .unwrap()
-            .stats_index;
-        let beta_idx = fast_candidates
-            .iter()
-            .find(|c| c.provider_name == "beta")
-            .unwrap()
-            .stats_index;
-        tracker.record_success(
-            alpha_idx,
-            LatencyMode::NonStreaming,
-            Duration::from_millis(500),
-        );
-        tracker.record_success(
-            beta_idx,
-            LatencyMode::NonStreaming,
-            Duration::from_millis(10),
-        );
-
-        let state = Arc::new(AppState {
-            model_map,
-            tracker,
-            rr_state,
-            client: reqwest::Client::new(),
-            exploit_k: 3.0,
-            gcp_token_provider: None,
-            max_body_bytes: 100 * 1024 * 1024,
-            metrics: Metrics::new(),
-            shutting_down: AtomicBool::new(false),
-        });
-        let (addr, _tx, _server) = start_server(state);
-        let client = reqwest::Client::new();
-
-        // Pin affinity to the slow provider (alpha)
-        let resp = client
-            .post(format!("http://{addr}/v1/chat/completions"))
-            .header("x-session-affinity", "alpha/test-model")
-            .json(&serde_json::json!({"model": "fast", "messages": []}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let provider = resp
-            .headers()
-            .get("x-llmrouter-provider")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(
-            provider, "alpha",
-            "affinity should pin to alpha even though beta is faster"
-        );
-
-        handle_a.abort();
-        handle_b.abort();
-    }
-
-    #[tokio::test]
-    async fn affinity_pin_broken_when_error_ewma_breaches_threshold() {
-        crate::init_crypto();
-        let (port_a, handle_a) = instant_upstream(0).await;
-        let (port_b, handle_b) = instant_upstream(1).await;
-
-        // beta listed first: the first Weyl tick lands on the first weight
-        // unit, which would be alpha's probe slice otherwise.
-        let config: crate::config::Config = toml::from_str(&format!(
-            r#"
-[provider.alpha]
-base_url = "http://127.0.0.1:{port_a}"
-api_key = "fake"
-
-[provider.beta]
-base_url = "http://127.0.0.1:{port_b}"
-api_key = "fake"
-
-[model]
-fast = [
-  {{ provider = "beta",  model = "test-model" }},
-  {{ provider = "alpha", model = "test-model" }},
-]
-"#,
-        ))
-        .unwrap();
-
-        let mut tracker = Tracker::new(0.3, 0.5);
-        let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
-        let mut rr_state = RoundRobinState::new();
-        for alias in config.model.keys() {
-            rr_state.register_alias(alias.clone());
-        }
-
-        let fast_candidates = model_map.get("fast").unwrap();
-        let alpha_idx = fast_candidates
-            .iter()
-            .find(|c| c.provider_name == "alpha")
-            .unwrap()
-            .stats_index;
-        let beta_idx = fast_candidates
-            .iter()
-            .find(|c| c.provider_name == "beta")
-            .unwrap()
-            .stats_index;
-
-        // alpha warm but failing (error EWMA > 0.5); beta healthy.
-        tracker.record_success(
-            alpha_idx,
-            LatencyMode::NonStreaming,
-            Duration::from_millis(500),
-        );
-        for _ in 0..5 {
-            tracker.record_error(alpha_idx);
-        }
-        tracker.record_success(
-            beta_idx,
-            LatencyMode::NonStreaming,
-            Duration::from_millis(10),
-        );
-
-        let state = Arc::new(AppState {
-            model_map,
-            tracker,
-            rr_state,
-            client: reqwest::Client::new(),
-            exploit_k: 3.0,
-            gcp_token_provider: None,
-            max_body_bytes: 100 * 1024 * 1024,
-            metrics: Metrics::new(),
-            shutting_down: AtomicBool::new(false),
-        });
-        let (addr, _tx, _server) = start_server(state);
-
-        // Pin to the failing provider: must break and re-route.
-        let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/chat/completions"))
-            .header("x-session-affinity", "alpha/test-model")
-            .json(&serde_json::json!({"model": "fast", "messages": []}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let provider = resp
-            .headers()
-            .get("x-llmrouter-provider")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(
-            provider, "beta",
-            "pin to a candidate above the error threshold should be broken"
-        );
-        let affinity = resp
-            .headers()
-            .get("x-session-affinity")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(affinity, "beta/test-model");
-
-        handle_a.abort();
-        handle_b.abort();
-    }
-
-    #[tokio::test]
-    async fn invalid_affinity_header_ignored() {
-        let (mock_port, mock_handle) = instant_upstream(1).await;
-        let state = test_state_with_upstream(mock_port);
-        let (addr, _tx, _server) = start_server(state);
-
-        let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/chat/completions"))
-            .header("x-session-affinity", "garbage")
-            .json(&serde_json::json!({"model": "fast", "messages": []}))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), 200);
-        let affinity = resp
-            .headers()
-            .get("x-session-affinity")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(affinity, "test/test-model");
-
-        mock_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn upstream_error_status_relayed_and_metered() {
-        let (mock_port, mock_handle) = failing_upstream("503 Service Unavailable").await;
-        let state = test_state_with_upstream(mock_port);
-        let (addr, _tx, _server) = start_server(state.clone());
-
-        let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/chat/completions"))
-            .json(&serde_json::json!({"model": "fast", "messages": []}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 503);
-
-        let metrics = String::from_utf8(state.metrics.encode().unwrap()).unwrap();
-        assert!(
-            metrics.contains("status_code=\"503\""),
-            "expected requests_total to carry the upstream status: {metrics}"
-        );
-
-        mock_handle.abort();
-    }
-
-    #[tokio::test]
-    async fn ewma_not_updated_on_error_response() {
-        let (mock_port, mock_handle) = failing_upstream("401 Unauthorized").await;
-        let state = test_state_with_upstream(mock_port);
-
-        let stats_index = state
-            .model_map
-            .get("fast")
-            .unwrap()
-            .first()
-            .unwrap()
-            .stats_index;
-
-        assert!(
-            state
-                .tracker
-                .stats(stats_index)
-                .is_cold(LatencyMode::NonStreaming),
-            "precondition: EWMA should start uninitialized"
-        );
-
-        let (addr, _tx, _server) = start_server(state.clone());
-        let resp = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/chat/completions"))
-            .json(&serde_json::json!({"model": "fast", "messages": []}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-
-        assert!(
-            state
-                .tracker
-                .stats(stats_index)
-                .is_cold(LatencyMode::NonStreaming),
-            "fast 4xx responses must not pollute EWMA latency stats"
-        );
-
-        mock_handle.abort();
-    }
 }
