@@ -2,8 +2,14 @@
 name = "sturnus"
 version = "5.0.0"
 edition = "2021"
+rust-version = "1.87"
 authors = ["Danny Boland <danny@boland.dev>"]
 license = "MIT"
+description = "OpenAI-compatible LLM proxy sidecar that routes across providers by live latency and error rate"
+repository = "https://github.com/sturnus-dev/sturnus"
+readme = "README.md"
+keywords = ["llm", "proxy", "load-balancer", "openai", "sidecar"]
+categories = ["command-line-utilities", "web-programming::http-server"]
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util"] }
